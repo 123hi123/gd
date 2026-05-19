@@ -6,7 +6,7 @@ A directory jumper that finds dirs by basename, ranked by selection history.
 
 ```
 gd (CLI)        — search index + TUI picker + shell hook
-gd-daemon       — fanotify filesystem watcher + index builder (CAP_SYS_ADMIN)
+gd-daemon       — fanotify filesystem watcher + index builder (CAP_SYS_ADMIN + CAP_DAC_READ_SEARCH)
 ```
 
 ## Key paths
@@ -27,7 +27,7 @@ systemctl --user stop gd-daemon
 cargo build --release --all
 cp -f target/release/gd ~/.cargo/bin/gd
 cp -f target/release/gd-daemon ~/.cargo/bin/gd-daemon
-sudo setcap cap_sys_admin+ep ~/.cargo/bin/gd-daemon
+sudo setcap cap_sys_admin,cap_dac_read_search+ep ~/.cargo/bin/gd-daemon
 systemctl --user start gd-daemon
 ```
 
@@ -40,8 +40,7 @@ systemctl --user start gd-daemon
 
 ## Constraints
 
-- Daemon peak RAM must stay under 200MB (currently ~143MB during rescan)
-- Daemon idle RAM: ~2MB
+- Daemon RAM: ~45MB (in-memory BTreeSet index)
 - Query latency: <25ms
 - Search matches **basename only**, not full path
-- fanotify requires CAP_SYS_ADMIN on gd-daemon binary
+- fanotify requires CAP_SYS_ADMIN + CAP_DAC_READ_SEARCH on gd-daemon binary

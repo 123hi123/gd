@@ -35,12 +35,12 @@ pub fn run() -> Result<()> {
     // Re-set capability
     let daemon_bin = cargo_bin.join("gd-daemon");
     let cap = Command::new("sudo")
-        .args(["setcap", "cap_sys_admin+ep"])
+        .args(["setcap", "cap_sys_admin,cap_dac_read_search+ep"])
         .arg(&daemon_bin)
         .status();
     match cap {
         Ok(s) if s.success() => {}
-        _ => eprintln!("warning: setcap failed. Run: sudo setcap cap_sys_admin+ep {}", daemon_bin.display()),
+        _ => eprintln!("warning: setcap failed. Run: sudo setcap cap_sys_admin,cap_dac_read_search+ep {}", daemon_bin.display()),
     }
 
     // Restart daemon — it will do a catchup scan, not full scan

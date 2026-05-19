@@ -21,12 +21,12 @@ pub fn run() -> Result<()> {
     if let Some(ref bin) = daemon_bin {
         eprintln!("setting CAP_SYS_ADMIN on {}...", bin.display());
         let status = Command::new("sudo")
-            .args(["setcap", "cap_sys_admin+ep"])
+            .args(["setcap", "cap_sys_admin,cap_dac_read_search+ep"])
             .arg(bin)
             .status();
         match status {
             Ok(s) if s.success() => eprintln!("capability set."),
-            _ => eprintln!("warning: failed to set capability. Run manually:\n  sudo setcap cap_sys_admin+ep {}", bin.display()),
+            _ => eprintln!("warning: failed to set capability. Run manually:\n  sudo setcap cap_sys_admin,cap_dac_read_search+ep {}", bin.display()),
         }
     } else {
         eprintln!("warning: gd-daemon binary not found. Install it first:\n  cargo install --path crates/gd-daemon");
