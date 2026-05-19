@@ -1,0 +1,18 @@
+[package]
+name = "gd-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gd-daemon"
+path = "src/main.rs"
+
+[dependencies]
+gd-core = { path = "../gd-core" }
+anyhow = "1"
+libc = "0.2"
+jwalk = "0.8"
+dirs = "6"
+signal-hook = "0.3"

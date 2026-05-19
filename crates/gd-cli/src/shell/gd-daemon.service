@@ -1,0 +1,13 @@
+[Unit]
+Description=gd directory jump daemon
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/gd-daemon
+Restart=on-failure
+RestartSec=5
+Environment=HOME=%h
+
+[Install]
+WantedBy=default.target
