@@ -1,18 +1,46 @@
+<div align="center">
+
 # gd
 
 **g**o **d**ir — a modern `cd`.
 
-> `gd >= cd`
+`gd >= cd`
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
+[![Shell: zsh | bash | fish | nu | pwsh](https://img.shields.io/badge/shell-zsh%20%7C%20bash%20%7C%20fish%20%7C%20nu%20%7C%20pwsh-green.svg)](#shell-support)
+
+[English](README.md) | [繁體中文](README.zh-TW.md)
 
 Type a name, land in the right directory. No full paths, no mental overhead.
 
-## Install
+</div>
+
+---
+
+## Why gd?
+
+| | `cd` | `gd` |
+|---|---|---|
+| Local dirs | `cd src` | `gd src` |
+| Go home | `cd` | `gd` |
+| Previous dir | `cd -` | `gd -` |
+| Full path | `cd /tmp` | `gd /tmp` |
+| Fuzzy search | - | `gd conf` |
+| History ranking | - | `gd proj` (remembers your picks) |
+| Shortcuts | - | `gd link k ~/code/kernel` |
+| Boost dirs | - | `gd boost ~/work` |
+
+Everything `cd` does, plus smart search when you need it.
+
+## Quick start
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/123hi123/gd/main/install.sh | bash
 ```
 
-Or manually:
+<details>
+<summary>Manual install</summary>
 
 ```bash
 git clone https://github.com/123hi123/gd.git && cd gd
@@ -21,69 +49,87 @@ cargo install --path crates/gd-daemon
 gd setup
 ```
 
-`gd setup` will:
+</details>
+
+`gd setup` handles everything:
+
 - Install the systemd daemon service
 - Set `CAP_SYS_ADMIN` on the daemon binary
-- Add the shell hook to your rc file (`.zshrc`, `.bashrc`, etc.)
+- Add the shell hook to your rc file
 - Ask if you want `alias cd=gd` (recommended)
 
-## How it works
+## Usage
 
 ```bash
-gd                  # no args → go home (like cd)
-gd src              # local ./src/ exists → jump there instantly
-gd config           # no local match → fuzzy-search filesystem, pick from TUI
-gd proj             # picked before? it remembers — selected dirs always rank first
-gd /tmp             # full path → jump directly (like cd /tmp)
-gd ../lib           # relative path → jump directly (like cd ../lib)
-gd -                # go to previous directory (like cd -)
+gd                  # go home
+gd src              # local ./src/ exists? jump instantly
+gd config           # no local match? fuzzy-search, pick from TUI
+gd proj             # picked before? ranked first — always
+gd /tmp             # full path? jump directly
+gd ../lib           # relative path? jump directly
+gd -                # previous directory
 ```
 
-If the argument contains `/`, gd treats it as a path: jump if it exists, fail if it doesn't — no search fallback. Without `/`, it's a search query.
+**The rule**: argument contains `/` = path mode (jump or fail). No `/` = search mode.
 
 ## Ranking
 
-1. **Links** — `gd link editor ~/code/editor` creates a permanent shortcut
-2. **Selected** — any dir you've picked via gd before, always above unselected
-3. **Visited** — dirs you've `cd`'d into, ranked by recency
-4. **Index** — filesystem scan by the background daemon, lowest priority
+| Priority | Source | Description |
+|---|---|---|
+| 1 | **Link** | `gd link editor ~/code/editor` — permanent shortcut |
+| 2 | **Selected** | Dirs you've picked via gd, always above unselected |
+| 3 | **Visited** | Dirs you've `cd`'d into, ranked by recency |
+| 4 | **Index** | Filesystem scan by background daemon |
 
-The key rule: **selected once > never selected**, regardless of match quality.
+> **Selected once > never selected**, regardless of match quality.
 
 ## Commands
 
-| Command | Description |
-|---|---|
-| `gd <query>` | Jump to a directory by name |
-| `gd link <alias> <path>` | Create a named shortcut |
-| `gd unlink <alias>` | Remove a shortcut |
-| `gd boost [path]` | Boost a directory's ranking (default: cwd, 5x) |
-| `gd unboost <path>` | Remove a boost |
-| `gd list` | Show links, boosts, and history stats |
-| `gd clean` | Remove entries pointing to dead paths |
-| `gd export` | Dump database as JSON |
-| `gd doctor` | Check installation health |
-| `gd setup` | Install daemon + shell hook + optional cd alias |
-| `gd update` | Rebuild and restart daemon (for developers) |
+```
+gd <query>              search and jump
+gd link <alias> <path>  create shortcut
+gd unlink <alias>       remove shortcut
+gd boost [path]         boost ranking (default: cwd, 5x)
+gd unboost <path>       remove boost
+gd list                 show links, boosts, stats
+gd clean                remove dead entries
+gd export               dump database as JSON
+gd doctor               check installation health
+gd setup                install daemon + hook + cd alias
+gd update               rebuild and restart (developers)
+```
 
 ## Architecture
 
 ```
-gd (CLI)        search index + TUI picker + shell hook
-gd-daemon       fanotify filesystem watcher + index builder
+                    +-----------+
+  gd <query> ----→ | gd (CLI)  | ----→ print path → shell cd
+                    +-----------+
+                         |
+                    read index + db
+                         |
+                    +-----------+
+                    | gd-daemon | ← fanotify filesystem watcher
+                    +-----------+
+                         |
+                    ~/.local/share/gd/
+                    ├── index     (directory list)
+                    └── db.json   (links + history + boosts)
 ```
 
-**gd-daemon** watches the filesystem via Linux's [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) API, building an index of all directories. This lets `gd` search instantly without running `find` or `fd` on every query.
+**gd-daemon** uses Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) to watch the filesystem in real-time, keeping the index fresh without periodic `find` scans.
 
-- Runs as a systemd user service (`~/.config/systemd/user/gd-daemon.service`)
-- Requires `CAP_SYS_ADMIN` for fanotify access (set automatically by `gd setup`)
-- Index stored at `~/.local/share/gd/index` (plain text, one path per line)
-- Peak RAM during rescan: ~143MB / idle: ~2MB
-- Selection history: `~/.local/share/gd/db.json`
+| | |
+|---|---|
+| Service | `~/.config/systemd/user/gd-daemon.service` |
+| Capability | `CAP_SYS_ADMIN` (fanotify) |
+| RAM (idle) | ~2 MB |
+| RAM (rescan) | ~143 MB |
+| Query latency | < 25 ms |
 
 ## Shell support
 
-zsh, bash, fish, nushell, powershell. Auto-detected by `gd setup`.
+zsh, bash, fish, nushell, powershell — auto-detected by `gd setup`.
 
 ## License
 
