@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo.png" alt="gd logo" width="120">
+
 # gd
 
 **g**o **d**ir — a modern `cd`.
@@ -13,6 +15,8 @@
 [English](README.md) | [繁體中文](README.zh-TW.md)
 
 Type a name, land in the right directory. No full paths, no mental overhead.
+
+<img src="assets/concept.png" alt="gd concept — type a name, land in the right place" width="600">
 
 </div>
 
@@ -133,6 +137,8 @@ gd update               rebuild and restart (developers)
 
 ## Architecture
 
+<img src="assets/banner.png" alt="gd architecture — filesystem constellation" width="700">
+
 ```
                     +-----------+
   gd <query> ----→ | gd (CLI)  | ----→ print path → shell cd
@@ -149,14 +155,13 @@ gd update               rebuild and restart (developers)
                     └── db.json   (links + history + boosts)
 ```
 
-**gd-daemon** uses Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) to watch the filesystem in real-time, keeping the index fresh without periodic `find` scans.
+**gd-daemon** uses Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) to watch the filesystem in real-time. Directory creates, deletes, and moves are tracked incrementally — no periodic `find` scans.
 
 | | |
 |---|---|
 | Service | `~/.config/systemd/user/gd-daemon.service` |
-| Capability | `CAP_SYS_ADMIN` (fanotify) |
-| RAM (idle) | ~2 MB |
-| RAM (rescan) | ~143 MB |
+| Capability | `CAP_SYS_ADMIN` + `CAP_DAC_READ_SEARCH` |
+| RAM | ~45 MB |
 | Query latency | < 25 ms |
 
 ## Shell support

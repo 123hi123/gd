@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo.png" alt="gd logo" width="120">
+
 # gd
 
 **g**o **d**ir — 更好的 `cd`。
@@ -13,6 +15,8 @@
 [English](README.md) | [繁體中文](README.zh-TW.md)
 
 打個名字，直達目錄。不用記路徑，不用動腦。
+
+<img src="assets/concept.png" alt="gd 概念 — 打個名字就到了" width="600">
 
 </div>
 
@@ -133,6 +137,8 @@ gd update               重新編譯並重啟（開發者用）
 
 ## 架構
 
+<img src="assets/banner.png" alt="gd 架構 — 檔案系統星座圖" width="700">
+
 ```
                     +-----------+
   gd <query> ----→ | gd (CLI)  | ----→ 輸出路徑 → shell cd
@@ -149,14 +155,13 @@ gd update               重新編譯並重啟（開發者用）
                     └── db.json   (快捷鍵 + 歷史 + 加權)
 ```
 
-**gd-daemon** 透過 Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) 即時監聽檔案系統變化，不需要定期執行 `find` 掃描。
+**gd-daemon** 透過 Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) 即時監聽檔案系統變化，目錄的建立、刪除、搬移都是增量追蹤——不需要定期全量掃描。
 
 | | |
 |---|---|
 | 服務 | `~/.config/systemd/user/gd-daemon.service` |
-| 權限 | `CAP_SYS_ADMIN`（fanotify） |
-| 記憶體（閒置） | ~2 MB |
-| 記憶體（掃描中） | ~143 MB |
+| 權限 | `CAP_SYS_ADMIN` + `CAP_DAC_READ_SEARCH` |
+| 記憶體 | ~45 MB |
 | 查詢延遲 | < 25 ms |
 
 ## Shell 支援
