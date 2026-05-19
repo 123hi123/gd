@@ -59,6 +59,28 @@ gd auth-service  # 不用管它在哪
 gd payments      # 上週選過？還是排第一
 ```
 
+**丟掉檔案管理器**
+
+不用 SSH，就在你自己的電腦前。打開終端 — 然後再也不用開 Nautilus/Dolphin/Thunar。想找資料夾？打名字就好：
+
+```bash
+gd Downloads    # 不用再點檔案管理器的側欄
+gd wallpapers   # 藏在 ~/Pictures/2024/wallpapers 裡？無所謂
+gd taxes        # ~/Documents/finance/2025/taxes — gd 記得
+```
+
+搬檔案、複製、預覽，全部在終端搞定：
+
+```bash
+gd projects     # 跳到專案資料夾
+ls              # 看看裡面有什麼
+gd taxes        # 跳去稅務資料夾，抓個檔案
+cp report.pdf ~/Desktop/
+gd projects     # 一條指令就回來
+```
+
+設定 `alias cd=gd` 之後，終端就是你的檔案管理器。每個去過的目錄都會被記住並排名 — 用越多，敲越少。
+
 **伺服器管理**
 
 在 `/etc/nginx`、`/var/log/app`、`/opt/services/monitoring` 之間跳來跳去：

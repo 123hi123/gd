@@ -59,6 +59,28 @@ gd auth-service  # don't care where it lives
 gd payments      # picked it last week? still ranked first
 ```
 
+**Ditch the file manager**
+
+You're on your local machine, no SSH. You open a terminal — and never leave it. Instead of clicking through Nautilus/Dolphin/Thunar to find that folder, just type the name:
+
+```bash
+gd Downloads    # no more ~/Downloads in the address bar
+gd wallpapers   # buried in ~/Pictures/2024/wallpapers? don't care
+gd taxes        # ~/Documents/finance/2025/taxes — gd knows
+```
+
+Move, copy, preview — all from the terminal:
+
+```bash
+gd projects     # jump to your project folder
+ls              # see what's there
+gd taxes        # jump to taxes, grab a file
+cp report.pdf ~/Desktop/
+gd projects     # back in one command
+```
+
+Once you alias `cd=gd`, your terminal *becomes* the file manager. Every directory you visit is remembered and ranked — the more you use it, the fewer keystrokes you need.
+
 **Server admin**
 
 Jumping between `/etc/nginx`, `/var/log/app`, `/opt/services/monitoring`:
