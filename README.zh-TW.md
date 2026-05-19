@@ -33,6 +33,38 @@
 
 `cd` 能做的全部包辦，再加上智慧搜尋。
 
+## 使用場景
+
+**手機 SSH + AI 寫程式**
+
+你人在外面，只有手機，SSH 連上遠端主機。在觸控鍵盤上打 `/home/deploy/projects/myapp-backend/src` 是一種折磨。用 gd：
+
+```bash
+gd myapp        # 你記得名字就夠了，不用記路徑
+claude           # 開 Claude Code 開始寫
+```
+
+只有模糊印象？夠用了，gd 找得到。上次選過？它已經排在第一位了。
+
+**深層專案目錄**
+
+Monorepo 有 200 個 package，微服務散落在 `/opt`、`/srv`、`/home`。你不需要記住每個路徑 — gd 幫你記：
+
+```bash
+gd auth-service  # 不用管它在哪
+gd payments      # 上週選過？還是排第一
+```
+
+**伺服器管理**
+
+在 `/etc/nginx`、`/var/log/app`、`/opt/services/monitoring` 之間跳來跳去：
+
+```bash
+gd link ng /etc/nginx
+gd link logs /var/log/app
+gd ng           # 秒到
+```
+
 ## 快速安裝
 
 ```bash

@@ -33,6 +33,38 @@ Type a name, land in the right directory. No full paths, no mental overhead.
 
 Everything `cd` does, plus smart search when you need it.
 
+## Use cases
+
+**Mobile SSH + AI coding**
+
+You're on a phone, SSH'd into a VPS. Typing `/home/deploy/projects/myapp-backend/src` on a touch keyboard is miserable. With gd:
+
+```bash
+gd myapp        # jump — you remember the name, not the path
+claude           # launch Claude Code and start coding
+```
+
+You have a vague memory of the name? Good enough. gd finds it. You used it before? It's already at the top.
+
+**Deep project trees**
+
+Monorepo with 200 packages, microservices spread across `/opt`, `/srv`, `/home`. You don't maintain a mental map — gd does it for you:
+
+```bash
+gd auth-service  # don't care where it lives
+gd payments      # picked it last week? still ranked first
+```
+
+**Server admin**
+
+Jumping between `/etc/nginx`, `/var/log/app`, `/opt/services/monitoring`:
+
+```bash
+gd link ng /etc/nginx
+gd link logs /var/log/app
+gd ng           # instant
+```
+
 ## Quick start
 
 ```bash
