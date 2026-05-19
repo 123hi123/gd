@@ -164,6 +164,10 @@ gd update               rebuild and restart (developers)
 | RAM | ~45 MB |
 | Query latency | < 25 ms |
 
+> 1 hour uptime, 7 seconds CPU — event-driven, not polling.
+>
+> <img src="assets/daemon-health.png" alt="daemon health: 1h uptime, 7s CPU" width="450">
+
 ## Shell support
 
 zsh, bash, fish, nushell, powershell — auto-detected by `gd setup`.

@@ -164,6 +164,10 @@ gd update               重新編譯並重啟（開發者用）
 | 記憶體 | ~45 MB |
 | 查詢延遲 | < 25 ms |
 
+> 運行 1 小時，CPU 僅用 7 秒——事件驅動，不輪詢。
+>
+> <img src="assets/daemon-health.png" alt="daemon 健康狀態：運行 1 小時，CPU 7 秒" width="450">
+
 ## Shell 支援
 
 zsh、bash、fish、nushell、powershell — `gd setup` 自動偵測。
