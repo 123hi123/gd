@@ -16,4 +16,7 @@ pub enum Error {
 
     #[error("database parse error: {0}")]
     Json(#[from] serde_json::Error),
+
+    #[error("database error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }

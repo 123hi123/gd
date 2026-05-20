@@ -1,140 +1,124 @@
-use std::collections::BTreeSet;
-use std::fs;
-use std::io::{self, BufRead, Write};
+use rusqlite::{params, Connection};
+use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn search_file(data_dir: &Path, query: &str) -> Vec<PathBuf> {
-    let file_path = data_dir.join("index");
-    let Ok(file) = fs::File::open(&file_path) else {
-        return Vec::new();
-    };
-
-    let query_lower = query.to_lowercase();
-    let reader = io::BufReader::with_capacity(64 * 1024, file);
-
-    reader
-        .lines()
-        .map_while(Result::ok)
-        .filter(|line| {
-            if line.is_empty() {
-                return false;
-            }
-            let basename = line.rsplit('/').next().unwrap_or("");
-            basename.to_lowercase().contains(&query_lower)
-        })
-        .map(PathBuf::from)
-        .collect()
-}
-
-pub fn index_exists(data_dir: &Path) -> bool {
-    let file_path = data_dir.join("index");
-    file_path.exists() && fs::metadata(&file_path).is_ok_and(|m| m.len() > 0)
-}
-
 pub struct PathIndex {
-    paths: BTreeSet<PathBuf>,
-    file_path: PathBuf,
-    dirty: bool,
+    conn: Connection,
 }
 
 impl PathIndex {
     pub fn open(data_dir: &Path) -> Self {
-        let file_path = data_dir.join("index");
-        let paths = if file_path.exists() {
-            load_from_file(&file_path).unwrap_or_default()
-        } else {
-            BTreeSet::new()
-        };
+        let db_path = data_dir.join("gd.db");
+        std::fs::create_dir_all(data_dir).ok();
+        let conn = Connection::open(&db_path).expect("failed to open gd.db");
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             PRAGMA busy_timeout = 30000;
+             PRAGMA synchronous = NORMAL;",
+        )
+        .expect("failed to set pragmas");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS dirs (
+                path TEXT PRIMARY KEY,
+                basename_lower TEXT NOT NULL,
+                visits INTEGER NOT NULL DEFAULT 0,
+                selections INTEGER NOT NULL DEFAULT 0,
+                last_access INTEGER NOT NULL DEFAULT 0,
+                in_index INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .expect("failed to create dirs table");
+        Self { conn }
+    }
 
-        Self {
-            paths,
-            file_path,
-            dirty: false,
+    pub fn add(&self, path: PathBuf) {
+        let path_str = path.to_string_lossy();
+        let basename_lower = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "INSERT INTO dirs (path, basename_lower, in_index)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(path) DO UPDATE SET
+               in_index = 1,
+               basename_lower = excluded.basename_lower",
+        ) {
+            stmt.execute(params![path_str.as_ref(), basename_lower]).ok();
         }
     }
 
-    pub fn add(&mut self, path: PathBuf) {
-        if self.paths.insert(path) {
-            self.dirty = true;
+    pub fn remove(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "DELETE FROM dirs WHERE path = ?1 AND visits = 0 AND selections = 0",
+        ) {
+            stmt.execute(params![path_str.as_ref()]).ok();
         }
-    }
-
-    pub fn remove(&mut self, path: &Path) {
-        if self.paths.remove(path) {
-            self.dirty = true;
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "UPDATE dirs SET in_index = 0 WHERE path = ?1",
+        ) {
+            stmt.execute(params![path_str.as_ref()]).ok();
         }
-    }
-
-    pub fn search(&self, query: &str) -> Vec<PathBuf> {
-        let query_lower = query.to_lowercase();
-        self.paths
-            .iter()
-            .filter(|p| {
-                let basename = p
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                basename.to_lowercase().contains(&query_lower)
-            })
-            .cloned()
-            .collect()
     }
 
     pub fn len(&self) -> usize {
-        self.paths.len()
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM dirs WHERE in_index = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.paths.is_empty()
+        self.len() == 0
     }
 
-    pub fn flush(&mut self) -> io::Result<()> {
-        if !self.dirty {
-            return Ok(());
+    pub fn has_data(&self) -> bool {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM dirs WHERE in_index = 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+    }
+
+    pub fn begin_bulk(&self) {
+        self.conn.execute_batch("BEGIN").ok();
+    }
+
+    pub fn end_bulk(&self) {
+        self.conn.execute_batch("COMMIT").ok();
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .ok();
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        if !self.conn.is_autocommit() {
+            self.conn
+                .execute_batch("COMMIT")
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
         }
-        self.save()?;
-        self.dirty = false;
         Ok(())
     }
 
-    pub fn save(&self) -> io::Result<()> {
-        if let Some(parent) = self.file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let tmp = self.file_path.with_extension("tmp");
-        let mut file = fs::File::create(&tmp)?;
-        for path in &self.paths {
-            writeln!(file, "{}", path.display())?;
-        }
-        file.sync_all()?;
-        fs::rename(&tmp, &self.file_path)?;
-        Ok(())
+    pub fn mark_all_not_indexed(&self) {
+        self.conn
+            .execute("UPDATE dirs SET in_index = 0", [])
+            .ok();
     }
 
-    pub fn replace_all(&mut self, paths: BTreeSet<PathBuf>) {
-        self.paths = paths;
-        self.dirty = true;
+    pub fn cleanup_stale(&self) {
+        self.conn
+            .execute(
+                "DELETE FROM dirs WHERE in_index = 0 AND visits = 0 AND selections = 0",
+                [],
+            )
+            .ok();
     }
-
-    pub fn file_path(&self) -> &Path {
-        &self.file_path
-    }
-
-    pub fn exists(&self) -> bool {
-        self.file_path.exists()
-    }
-}
-
-fn load_from_file(path: &Path) -> io::Result<BTreeSet<PathBuf>> {
-    let file = fs::File::open(path)?;
-    let reader = io::BufReader::new(file);
-    let mut set = BTreeSet::new();
-    for line in reader.lines() {
-        let line = line?;
-        if !line.is_empty() {
-            set.insert(PathBuf::from(line));
-        }
-    }
-    Ok(set)
 }

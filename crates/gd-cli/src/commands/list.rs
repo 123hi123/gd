@@ -14,7 +14,7 @@ pub fn run(store: &KeyStore, json: bool) -> Result<()> {
         eprintln!("no links.");
     } else {
         eprintln!("links:");
-        for (alias, path) in links {
+        for (alias, path) in &links {
             let status = if path.exists() { "" } else { " (missing)" };
             eprintln!("  {alias} → {}{status}", display_with_tilde(path));
         }
@@ -23,7 +23,7 @@ pub fn run(store: &KeyStore, json: bool) -> Result<()> {
     let boosts = store.list_boosts();
     if !boosts.is_empty() {
         eprintln!("boosts:");
-        for (path, weight) in boosts {
+        for (path, weight) in &boosts {
             eprintln!("  {} (×{weight})", display_with_tilde(path));
         }
     }

@@ -25,7 +25,6 @@ const EXCLUDE_NAMES: &[&str] = &[
     ".npm",
     ".cargo",
     ".rustup",
-    ".local",
     ".nvm",
     ".conda",
     "snap",
@@ -54,7 +53,6 @@ fn main() -> Result<()> {
         .join("gd");
     std::fs::create_dir_all(&data_dir)?;
 
-    let index_path = data_dir.join("index");
     let pid_file = data_dir.join("daemon.pid");
     let timestamp_file = data_dir.join("daemon.timestamp");
 
@@ -71,33 +69,33 @@ fn main() -> Result<()> {
     fan::mark_filesystem(fan_fd, &home)
         .context("fanotify_mark failed")?;
 
-    // Initial scan
-    if index_path.exists() {
+    let index = PathIndex::open(&data_dir);
+
+    if !index.has_data() {
+        eprintln!("gd-daemon: no index, scanning {}...", home.display());
+        let count = scanner::full_scan(&home, &index)?;
+        eprintln!("gd-daemon: indexed {count} dirs.");
+    } else {
         let last_ts = read_timestamp(&timestamp_file);
         if let Some(since) = last_ts {
             eprintln!("gd-daemon: catching up since last shutdown...");
-            match scanner::catchup_scan_to_file(&home, &index_path, &index_path, since) {
+            match scanner::catchup_scan(&home, &index, since) {
                 Ok(added) => eprintln!("gd-daemon: added {added} new dirs."),
                 Err(e) => {
                     eprintln!("gd-daemon: catchup failed ({e}), doing full scan...");
-                    let count = scanner::full_scan_to_file(&home, &index_path)?;
+                    let count = scanner::full_scan(&home, &index)?;
                     eprintln!("gd-daemon: indexed {count} dirs.");
                 }
             }
         } else {
             eprintln!("gd-daemon: index exists.");
         }
-    } else {
-        eprintln!("gd-daemon: no index, scanning {}...", home.display());
-        let count = scanner::full_scan_to_file(&home, &index_path)?;
-        eprintln!("gd-daemon: indexed {count} dirs.");
     }
 
-    // Load index into memory for incremental updates
-    let mut index = PathIndex::open(&data_dir);
-    eprintln!("gd-daemon: loaded {} dirs into memory. Watching.", index.len());
+    unsafe { libc::malloc_trim(0) };
+    eprintln!("gd-daemon: {} dirs indexed. Watching.", index.len());
 
-    // Event loop — incremental updates only
+    // Event loop
     let mut last_flush = Instant::now();
 
     while running.load(Ordering::Relaxed) {
@@ -125,7 +123,6 @@ fn main() -> Result<()> {
                 }
             }
             Ok(false) => {
-                // poll timeout — good time to flush if dirty
                 if let Err(e) = index.flush() {
                     eprintln!("gd-daemon: flush error: {e}");
                 }
@@ -135,7 +132,6 @@ fn main() -> Result<()> {
         }
     }
 
-    // Final flush + shutdown timestamp
     if let Err(e) = index.flush() {
         eprintln!("gd-daemon: final flush error: {e}");
     }

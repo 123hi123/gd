@@ -166,24 +166,21 @@ gd update               rebuild and restart (developers)
   gd <query> ----→ | gd (CLI)  | ----→ print path → shell cd
                     +-----------+
                          |
-                    read index + db
-                         |
                     +-----------+
                     | gd-daemon | ← fanotify filesystem watcher
                     +-----------+
                          |
                     ~/.local/share/gd/
-                    ├── index     (directory list)
-                    └── db.json   (links + history + boosts)
+                    └── gd.db   (SQLite — index + history + links + boosts)
 ```
 
-**gd-daemon** uses Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) to watch the filesystem in real-time. Directory creates, deletes, and moves are tracked incrementally — no periodic `find` scans.
+**gd-daemon** uses Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) to watch the filesystem in real-time. Directory creates, deletes, and moves are tracked incrementally — no periodic `find` scans. Both daemon and CLI share one SQLite database with WAL mode for safe concurrent access.
 
 | | |
 |---|---|
 | Service | `~/.config/systemd/user/gd-daemon.service` |
 | Capability | `CAP_SYS_ADMIN` + `CAP_DAC_READ_SEARCH` |
-| RAM | ~45 MB |
+| RAM | ~15 MB |
 | Query latency | < 25 ms |
 
 > 1 hour uptime, 7 seconds CPU — event-driven, not polling.

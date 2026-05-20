@@ -11,8 +11,7 @@ gd-daemon       — fanotify filesystem watcher + index builder (CAP_SYS_ADMIN +
 
 ## Key paths
 
-- Index: `~/.local/share/gd/index` (plain text, one path per line)
-- DB: `~/.local/share/gd/db.json` (links + history + selection counts)
+- DB: `~/.local/share/gd/gd.db` (SQLite — unified index + history + links + boosts)
 - Service: `~/.config/systemd/user/gd-daemon.service`
 
 ## Development workflow
@@ -40,7 +39,7 @@ systemctl --user start gd-daemon
 
 ## Constraints
 
-- Daemon RAM: ~45MB (in-memory BTreeSet index)
+- Daemon RAM: ~15MB (SQLite-backed, no in-memory index)
 - Query latency: <25ms
 - Search matches **basename only**, not full path
 - fanotify requires CAP_SYS_ADMIN + CAP_DAC_READ_SEARCH on gd-daemon binary

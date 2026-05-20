@@ -1,6 +1,5 @@
+use gd_core::index::PathIndex;
 use jwalk::WalkDir;
-use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 const EXCLUDE_NAMES: &[&str] = &[
@@ -20,23 +19,19 @@ const EXCLUDE_NAMES: &[&str] = &[
     ".npm",
     ".cargo",
     ".rustup",
-    ".local",
     ".nvm",
     ".conda",
     "snap",
 ];
 
-/// Stream scan results directly to file. Never holds all paths in memory.
-/// Returns the number of directories found.
-pub fn full_scan_to_file(root: &Path, output: &Path) -> std::io::Result<usize> {
-    let tmp = output.with_extension("tmp");
-    let file = fs::File::create(&tmp)?;
-    let mut writer = BufWriter::with_capacity(128 * 1024, file);
+pub fn full_scan(root: &Path, index: &PathIndex) -> std::io::Result<usize> {
+    index.mark_all_not_indexed();
+    index.begin_bulk();
     let mut count = 0usize;
 
     for entry in WalkDir::new(root)
         .skip_hidden(false)
-        .parallelism(jwalk::Parallelism::RayonNewPool(2)) // limit threads
+        .parallelism(jwalk::Parallelism::RayonNewPool(2))
         .process_read_dir(|_, _, _, entries| {
             entries.retain(|e| {
                 if let Ok(entry) = e {
@@ -53,25 +48,18 @@ pub fn full_scan_to_file(root: &Path, output: &Path) -> std::io::Result<usize> {
         .flatten()
     {
         if entry.file_type().is_dir() {
-            writeln!(writer, "{}", entry.path().display())?;
+            index.add(entry.path().to_path_buf());
             count += 1;
         }
     }
 
-    writer.flush()?;
-    drop(writer);
-    fs::rename(&tmp, output)?;
+    index.end_bulk();
+    index.cleanup_stale();
     Ok(count)
 }
 
-/// Quick catchup scan: only find dirs modified since a given timestamp.
-/// Walks the full tree but only adds dirs with mtime > since.
-pub fn catchup_scan_to_file(root: &Path, existing_index: &Path, output: &Path, since: u64) -> std::io::Result<usize> {
-    // Start from existing index
-    fs::copy(existing_index, output)?;
-
-    let file = fs::File::options().append(true).open(output)?;
-    let mut writer = BufWriter::new(file);
+pub fn catchup_scan(root: &Path, index: &PathIndex, since: u64) -> std::io::Result<usize> {
+    index.begin_bulk();
     let mut added = 0usize;
 
     for entry in WalkDir::new(root)
@@ -100,7 +88,7 @@ pub fn catchup_scan_to_file(root: &Path, existing_index: &Path, output: &Path, s
                         .unwrap_or_default()
                         .as_secs();
                     if mtime_secs > since {
-                        writeln!(writer, "{}", entry.path().display())?;
+                        index.add(entry.path().to_path_buf());
                         added += 1;
                     }
                 }
@@ -108,6 +96,6 @@ pub fn catchup_scan_to_file(root: &Path, existing_index: &Path, output: &Path, s
         }
     }
 
-    writer.flush()?;
+    index.end_bulk();
     Ok(added)
 }

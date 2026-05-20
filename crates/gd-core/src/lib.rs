@@ -4,7 +4,8 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::must_use_candidate,
-    clippy::cast_precision_loss
+    clippy::cast_precision_loss,
+    clippy::missing_safety_doc
 )]
 
 pub mod db;

@@ -166,24 +166,21 @@ gd update               重新編譯並重啟（開發者用）
   gd <query> ----→ | gd (CLI)  | ----→ 輸出路徑 → shell cd
                     +-----------+
                          |
-                    讀取 index + db
-                         |
                     +-----------+
                     | gd-daemon | ← fanotify 檔案系統監聽
                     +-----------+
                          |
                     ~/.local/share/gd/
-                    ├── index     (目錄清單)
-                    └── db.json   (快捷鍵 + 歷史 + 加權)
+                    └── gd.db   (SQLite — 索引 + 歷史 + 快捷鍵 + 加權)
 ```
 
-**gd-daemon** 透過 Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) 即時監聽檔案系統變化，目錄的建立、刪除、搬移都是增量追蹤——不需要定期全量掃描。
+**gd-daemon** 透過 Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) 即時監聯檔案系統變化，目錄的建立、刪除、搬移都是增量追蹤——不需要定期全量掃描。Daemon 與 CLI 共用一個 SQLite 資料庫，以 WAL 模式安全並發存取。
 
 | | |
 |---|---|
 | 服務 | `~/.config/systemd/user/gd-daemon.service` |
 | 權限 | `CAP_SYS_ADMIN` + `CAP_DAC_READ_SEARCH` |
-| 記憶體 | ~45 MB |
+| 記憶體 | ~15 MB |
 | 查詢延遲 | < 25 ms |
 
 > 運行 1 小時，CPU 僅用 7 秒——事件驅動，不輪詢。
