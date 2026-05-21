@@ -19,15 +19,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir = cli.data_dir.as_deref();
 
-    if let Some(ref query) = cli.query {
+    if !cli.query.is_empty() {
+        let query = cli.query.join(" ");
         let mut store = KeyStore::open(data_dir)?;
-        return commands::jump::run(&mut store, query);
+        return commands::jump::run(&mut store, &query);
     }
 
     match cli.command {
         Some(Command::Jump { ref query }) => {
+            let query_str = query.join(" ");
             let mut store = KeyStore::open(data_dir)?;
-            commands::jump::run(&mut store, query)
+            commands::jump::run(&mut store, &query_str)
         }
         Some(Command::Hook { ref path }) => {
             let mut store = KeyStore::open(data_dir)?;

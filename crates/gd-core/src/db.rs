@@ -257,6 +257,89 @@ impl KeyStore {
         results
     }
 
+    pub fn search_history_multi(&self, keywords: &[&str]) -> Vec<SearchResult> {
+        let now = frecency::now_secs();
+        let ordered = keywords
+            .iter()
+            .map(|k| k.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("%");
+        let pattern = format!("%{ordered}%");
+        let last_kw = keywords.last().copied().unwrap_or("").to_lowercase();
+
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT path, basename_lower, visits, selections, last_access
+                 FROM dirs
+                 WHERE basename_lower LIKE ?1
+                   AND (visits > 0 OR selections > 0)",
+            )
+            .unwrap();
+
+        let mut results: Vec<SearchResult> = stmt
+            .query_map(params![pattern], |row| {
+                let path_str: String = row.get(0)?;
+                let basename_lower: String = row.get(1)?;
+                let visits: u64 = row.get(2)?;
+                let selections: u64 = row.get(3)?;
+                let last_access: u64 = row.get(4)?;
+                Ok((
+                    PathBuf::from(path_str),
+                    basename_lower,
+                    visits,
+                    selections,
+                    last_access,
+                ))
+            })
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|(path, _, _, _, _)| path.exists())
+            .map(|(path, basename_lower, visits, selections, last_access)| {
+                const SELECTED_TIER: f64 = 100_000.0;
+                let decay = frecency::decay_factor(now.saturating_sub(last_access));
+                let frecency_score = if selections > 0 {
+                    SELECTED_TIER + (selections as f64 * 10.0 + visits as f64) * decay
+                } else {
+                    visits as f64 * decay
+                };
+                let score = frecency_score + match_quality_bonus(&basename_lower, &last_kw);
+                SearchResult {
+                    path,
+                    score,
+                    source: ResultSource::History,
+                }
+            })
+            .collect();
+
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results
+    }
+
+    pub fn search_index_multi(&self, keywords: &[&str]) -> Vec<PathBuf> {
+        let ordered = keywords
+            .iter()
+            .map(|k| k.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("%");
+        let pattern = format!("%{ordered}%");
+
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT path FROM dirs
+                 WHERE in_index = 1 AND basename_lower LIKE ?1",
+            )
+            .unwrap();
+        stmt.query_map(params![pattern], |row| {
+            let s: String = row.get(0)?;
+            Ok(PathBuf::from(s))
+        })
+        .unwrap()
+        .filter_map(Result::ok)
+        .collect()
+    }
+
     // --- Index queries (replaces index::search_file / index::index_exists) ---
 
     pub fn has_index(&self) -> bool {

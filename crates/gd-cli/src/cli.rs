@@ -12,9 +12,9 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Directory name to search and jump to
+    /// Directory name keywords to search (space-separated, all must match)
     #[arg(value_name = "QUERY", conflicts_with = "command")]
-    pub query: Option<String>,
+    pub query: Vec<String>,
 
     /// Override data directory
     #[arg(long, global = true)]
@@ -33,8 +33,9 @@ pub struct Cli {
 pub enum Command {
     /// Jump to a directory matching query (used by shell wrapper)
     Jump {
-        /// Directory name to search
-        query: String,
+        /// Directory name keywords to search
+        #[arg(required = true)]
+        query: Vec<String>,
     },
 
     /// Record a cd visit (called by shell hook, not for users)
