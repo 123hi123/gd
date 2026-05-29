@@ -157,6 +157,34 @@ gd setup                install daemon + hook + cd alias
 gd update               rebuild and restart (developers)
 ```
 
+## Comfort by design
+
+> Everything we do behind the scenes so the foreground feels effortless — one by one.
+
+**Matching bends to your memory**
+
+- **Three-layer matching** — exact match first, then fuzzy subsequence (`gd cbz rdr` finds `cbz-reader`), then edit-distance typo tolerance (`gd raeder cbz` still lands). Abbreviate it, misremember it, fat-finger it — you still arrive.
+- **Forgiving multi-keyword search** — keywords match in any order, and a half-remembered query like `gd open cbz` still surfaces candidates from your history instead of a dead-end "no matches".
+- **Names, not paths** — you only ever type a basename. Every parent directory is indexed in its own right, so any folder anywhere is reachable by the name you actually remember — no hierarchy to recall.
+
+**Ranking that learns you**
+
+- **Frecency** — frequency × recency with time decay. The dirs you live in rise to the top on their own; the ones you've abandoned quietly sink.
+- **Your picks always win** — a directory you've selected once outranks any never-selected index match, regardless of match quality.
+- **Pin what matters** — `gd link` for permanent shortcuts, `gd boost` to weight a whole subtree the way you think about it.
+
+**Never the wrong guess**
+
+- **You choose, gd suggests** — when several directories match, an interactive TUI picker lets you pick the right one; gd never silently jumps somewhere wrong.
+- **No dead ends** — paths that no longer exist are filtered out at query time, so you're never offered a folder that's already gone.
+- **`cd`, only better** — local `./src`, absolute `/paths`, `../relative`, `gd -`, and bare `gd` for home all still work. Alias `cd=gd` and lose nothing.
+
+**Invisible, lightweight infrastructure**
+
+- **Always-fresh index** — a fanotify watcher tracks creates, deletes, and moves in real time. No periodic `find` scans, no stale results.
+- **Stays out of your way** — ~15 MB RAM, ~7 s of CPU per hour of uptime, < 25 ms queries. Event-driven, never polling.
+- **One safe store** — daemon and CLI share a single SQLite database in WAL mode: concurrent, consistent, corruption-free.
+
 ## Architecture
 
 <img src="assets/banner.png" alt="gd architecture — filesystem constellation" width="700">
