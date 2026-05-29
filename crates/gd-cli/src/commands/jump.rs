@@ -302,7 +302,7 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
         let patterns: Vec<Pattern> = keywords
             .iter()
             .map(|kw| {
-                Pattern::new(kw, CaseMatching::Ignore, Normalization::Smart, AtomKind::Substring)
+                Pattern::new(kw, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy)
             })
             .collect();
 
@@ -311,7 +311,7 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 continue;
             }
             let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if let Some(total_score) =
+            if let Some((total_score, matched)) =
                 fuzzy_match_words(keywords, &patterns, basename, &mut matcher)
             {
                 let decay =
@@ -323,9 +323,17 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 } else {
                     entry.visits as f64 * decay
                 };
+                // soft-AND: partial matches (matched < keywords) are allowed from
+                // history only, demoted by (matched / total)^2 so a full match always
+                // outranks a partial one.
+                #[allow(clippy::cast_precision_loss)]
+                let penalty = {
+                    let ratio = matched as f64 / keywords.len() as f64;
+                    ratio * ratio
+                };
                 results.push(SearchResult {
                     path: path.clone(),
-                    score: base * 0.5 + f64::from(total_score),
+                    score: (base * 0.5 + f64::from(total_score)) * penalty,
                     source: ResultSource::History,
                 });
             }
@@ -333,9 +341,15 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
         if store.has_index() {
             for (path_str, basename) in store.all_index_entries() {
-                if let Some(total_score) =
+                if let Some((total_score, matched)) =
                     fuzzy_match_words(keywords, &patterns, &basename, &mut matcher)
                 {
+                    // index has ~246k entries vs ~73 in history: surfacing partial
+                    // matches here floods the picker (e.g. "open" alone hits 745 dirs),
+                    // so require all keywords to match for index results.
+                    if matched < keywords.len() {
+                        continue;
+                    }
                     let path = PathBuf::from(&path_str);
                     let mut rank = f64::from(total_score) * 0.01;
                     if let Some(ref h) = home {
@@ -365,24 +379,31 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
     results
 }
 
+/// Match each keyword against the words of `basename` (split on `-`, `_`, `.`, space).
+///
+/// Returns `(summed_score, matched_count)`, or `None` if no keyword matched at all.
+/// A keyword that matches neither fuzzily nor within its edit-distance threshold is
+/// simply skipped rather than failing the whole basename (soft-AND) — the caller
+/// decides whether a partial match (`matched_count < keywords.len()`) is acceptable.
 fn fuzzy_match_words(
     keywords: &[&str],
     patterns: &[Pattern],
     basename: &str,
     matcher: &mut Matcher,
-) -> Option<u32> {
+) -> Option<(u32, usize)> {
     let words: Vec<&str> = basename
         .split(|c: char| c == '-' || c == '_' || c == '.' || c == ' ')
         .filter(|s| !s.is_empty())
         .collect();
     let mut total = 0u32;
+    let mut matched = 0usize;
     for (kw, pattern) in keywords.iter().zip(patterns.iter()) {
         let mut best_fuzzy = 0u32;
         let mut best_edit = usize::MAX;
         for word in &words {
-            let matched: Vec<(&str, u32)> =
+            let hits: Vec<(&str, u32)> =
                 pattern.match_list(std::iter::once(*word), matcher);
-            if let Some(&(_, s)) = matched.first() {
+            if let Some(&(_, s)) = hits.first() {
                 best_fuzzy = best_fuzzy.max(s);
             }
             best_edit = best_edit.min(damerau_levenshtein(kw, word));
@@ -390,13 +411,17 @@ fn fuzzy_match_words(
         let max_dist = edit_distance_threshold(kw);
         if best_fuzzy > 0 {
             total += best_fuzzy;
+            matched += 1;
         } else if best_edit <= max_dist {
             total += 40u32.saturating_sub(best_edit as u32 * 15);
-        } else {
-            return None;
+            matched += 1;
         }
     }
-    Some(total)
+    if matched == 0 {
+        None
+    } else {
+        Some((total, matched))
+    }
 }
 
 fn edit_distance_threshold(keyword: &str) -> usize {
