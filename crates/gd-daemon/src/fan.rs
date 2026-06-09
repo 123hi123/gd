@@ -11,16 +11,18 @@ const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
 const FAN_MARK_MOUNT: u32 = 0x0000_0010;
 const FAN_CREATE: u64 = 0x0000_0100;
 const FAN_DELETE: u64 = 0x0000_0200;
-const FAN_MOVED_FROM: u64 = 0x0000_0040;
-const FAN_MOVED_TO: u64 = 0x0000_0080;
+const FAN_RENAME: u64 = 0x1000_0000;
 const FAN_ONDIR: u64 = 0x4000_0000;
 
 const EVENT_METADATA_LEN: usize = 24;
 const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
+const FAN_EVENT_INFO_TYPE_OLD_DFID_NAME: u8 = 10;
+const FAN_EVENT_INFO_TYPE_NEW_DFID_NAME: u8 = 12;
 
 pub enum DirEvent {
     Created(PathBuf),
     Deleted(PathBuf),
+    Renamed(PathBuf, PathBuf),
 }
 
 pub fn init() -> io::Result<i32> {
@@ -59,7 +61,7 @@ pub fn mark_filesystem(fd: i32, path: &Path) -> io::Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
-    let mask = FAN_CREATE | FAN_DELETE | FAN_MOVED_FROM | FAN_MOVED_TO | FAN_ONDIR;
+    let mask = FAN_CREATE | FAN_DELETE | FAN_RENAME | FAN_ONDIR;
 
     let ret = unsafe {
         let r = libc::syscall(
@@ -134,10 +136,42 @@ pub fn read_events(fd: i32, mount_fd: i32) -> Vec<DirEvent> {
             if mask & FAN_ONDIR != 0 {
                 let info_start = offset + EVENT_METADATA_LEN;
                 let info_end = offset + event_len;
-                if let Some(path) = parse_dfid_name(&buf[info_start..info_end], mount_fd) {
-                    if mask & (FAN_CREATE | FAN_MOVED_TO) != 0 {
+                let info_buf = &buf[info_start..info_end];
+
+                if mask & FAN_RENAME != 0 {
+                    // A rename carries two info records in one event:
+                    // OLD_DFID_NAME (source) and NEW_DFID_NAME (destination).
+                    let mut old_path = None;
+                    let mut new_path = None;
+                    let mut p = 0;
+                    while p + 4 <= info_buf.len() {
+                        let rec_type = info_buf[p];
+                        let rec_len = u16::from_ne_bytes(
+                            info_buf[p + 2..p + 4].try_into().unwrap(),
+                        ) as usize;
+                        if rec_len < 4 || p + rec_len > info_buf.len() {
+                            break;
+                        }
+                        let rec = &info_buf[p..p + rec_len];
+                        if rec_type == FAN_EVENT_INFO_TYPE_OLD_DFID_NAME {
+                            old_path = parse_dfid_name(rec, mount_fd);
+                        } else if rec_type == FAN_EVENT_INFO_TYPE_NEW_DFID_NAME {
+                            new_path = parse_dfid_name(rec, mount_fd);
+                        }
+                        p += rec_len;
+                    }
+                    match (old_path, new_path) {
+                        (Some(o), Some(n)) => events.push(DirEvent::Renamed(o, n)),
+                        // Only one side is inside the watched filesystem: a lone
+                        // source is effectively a deletion, a lone destination a creation.
+                        (Some(o), None) => events.push(DirEvent::Deleted(o)),
+                        (None, Some(n)) => events.push(DirEvent::Created(n)),
+                        (None, None) => {}
+                    }
+                } else if let Some(path) = parse_dfid_name(info_buf, mount_fd) {
+                    if mask & FAN_CREATE != 0 {
                         events.push(DirEvent::Created(path));
-                    } else if mask & (FAN_DELETE | FAN_MOVED_FROM) != 0 {
+                    } else if mask & FAN_DELETE != 0 {
                         events.push(DirEvent::Deleted(path));
                     }
                 }
@@ -159,7 +193,10 @@ fn parse_dfid_name(info_buf: &[u8], mount_fd: i32) -> Option<PathBuf> {
     let info_type = info_buf[0];
     let info_len = u16::from_ne_bytes(info_buf[2..4].try_into().unwrap()) as usize;
 
-    if info_type != FAN_EVENT_INFO_TYPE_DFID_NAME {
+    if info_type != FAN_EVENT_INFO_TYPE_DFID_NAME
+        && info_type != FAN_EVENT_INFO_TYPE_OLD_DFID_NAME
+        && info_type != FAN_EVENT_INFO_TYPE_NEW_DFID_NAME
+    {
         return None;
     }
     if info_len > info_buf.len() {

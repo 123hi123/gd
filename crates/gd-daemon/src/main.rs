@@ -112,6 +112,18 @@ fn main() -> Result<()> {
                         fan::DirEvent::Deleted(path) => {
                             index.remove(&path);
                         }
+                        fan::DirEvent::Renamed(old, new) => {
+                            if is_excluded(&new) {
+                                // Moved into an excluded dir (e.g. node_modules):
+                                // no per-child delete events arrive, so drop the
+                                // old subtree by prefix.
+                                index.remove_subtree(&old);
+                            } else if index.rename(&old, &new) == 0 {
+                                // Source wasn't indexed (e.g. moved in from an
+                                // excluded/unwatched location): index the new dir.
+                                index.add(new);
+                            }
+                        }
                     }
                 }
 

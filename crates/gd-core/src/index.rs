@@ -63,6 +63,55 @@ impl PathIndex {
         }
     }
 
+    /// Move `old` and its entire subtree under `new` with a single prefix-rewrite
+    /// UPDATE. History columns (visits/selections/last_access) are preserved in
+    /// place — no filesystem rescan. Returns the number of rows moved.
+    pub fn rename(&self, old: &Path, new: &Path) -> usize {
+        let old_str = old.to_string_lossy();
+        let new_str = new.to_string_lossy();
+        let new_base = new
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let old_like = escape_like(&old_str);
+        // OR REPLACE: if a stale entry already occupies the destination path
+        // (e.g. a deleted dir that kept its history), drop it so the primary-key
+        // move can land instead of silently failing on the UNIQUE constraint.
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "UPDATE OR REPLACE dirs
+             SET path = ?2 || substr(path, length(?1) + 1),
+                 basename_lower = CASE WHEN path = ?1 THEN ?3 ELSE basename_lower END
+             WHERE path = ?1 OR path LIKE ?4 || '/%' ESCAPE '\\'",
+        ) {
+            return stmt
+                .execute(params![old_str.as_ref(), new_str.as_ref(), new_base, old_like])
+                .unwrap_or(0);
+        }
+        0
+    }
+
+    /// Remove `path` and its entire subtree (prefix match). Entries with history
+    /// are kept but marked out-of-index. Used when a directory is renamed into an
+    /// excluded location, which produces no per-child delete events.
+    pub fn remove_subtree(&self, path: &Path) {
+        let path_str = path.to_string_lossy();
+        let like = escape_like(&path_str);
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "DELETE FROM dirs
+             WHERE (path = ?1 OR path LIKE ?2 || '/%' ESCAPE '\\')
+               AND visits = 0 AND selections = 0",
+        ) {
+            stmt.execute(params![path_str.as_ref(), like]).ok();
+        }
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "UPDATE dirs SET in_index = 0
+             WHERE path = ?1 OR path LIKE ?2 || '/%' ESCAPE '\\'",
+        ) {
+            stmt.execute(params![path_str.as_ref(), like]).ok();
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.conn
             .query_row(
@@ -121,4 +170,17 @@ impl PathIndex {
             )
             .ok();
     }
+}
+
+/// Escape SQL LIKE wildcards (`%` `_`) and the escape char itself so a literal
+/// path can be used safely as a prefix pattern. Pairs with `ESCAPE '\'`.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\\' || c == '%' || c == '_' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
