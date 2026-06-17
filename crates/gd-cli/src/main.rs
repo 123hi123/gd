@@ -8,6 +8,7 @@
 
 mod cli;
 mod commands;
+mod i18n;
 mod tui;
 
 use anyhow::Result;
@@ -42,6 +43,10 @@ fn main() -> Result<()> {
         Some(Command::Unlink { ref alias }) => {
             let mut store = KeyStore::open(data_dir)?;
             commands::link::remove(&mut store, alias)
+        }
+        Some(Command::Config { ref args }) => {
+            let mut store = KeyStore::open(data_dir)?;
+            commands::config::run(&mut store, args)
         }
         Some(Command::List) => {
             let store = KeyStore::open(data_dir)?;

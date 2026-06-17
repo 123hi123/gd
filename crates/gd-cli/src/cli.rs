@@ -45,11 +45,23 @@ pub enum Command {
         path: PathBuf,
     },
 
-    /// Link an alias to a specific path
+    /// Bind a name to a directory — `gd link <name> <path>`
+    ///
+    /// Takes two arguments, in this order:
+    ///   1. <name>  the shortcut you'll type later (e.g. `dl`)
+    ///   2. <path>  the directory it should point at (e.g. ~/下載)
+    ///
+    /// Afterwards `gd <name>` jumps straight there, ranked top of the list.
+    ///
+    /// Example:
+    ///   gd link dl ~/下載      # then `gd dl` → ~/下載
+    #[command(verbatim_doc_comment)]
     Link {
-        /// Short alias name
+        /// 1st arg — the shortcut name you'll type later (e.g. `dl`)
+        #[arg(value_name = "name")]
         alias: String,
-        /// Full path to link
+        /// 2nd arg — the directory that name points at (e.g. ~/下載)
+        #[arg(value_name = "path")]
         path: PathBuf,
     },
 
@@ -57,6 +69,19 @@ pub enum Command {
     Unlink {
         /// Alias to remove
         alias: String,
+    },
+
+    /// Get or set preferences (e.g. the picker layout)
+    ///
+    /// gd config                      show every setting and its value
+    /// gd config layout               show one setting
+    /// gd config layout traditional   switch the picker to the full-screen
+    ///                                classic list (default: inline)
+    #[command(verbatim_doc_comment)]
+    Config {
+        /// A setting name, optionally followed by a new value
+        #[arg(value_name = "key/value")]
+        args: Vec<String>,
     },
 
     /// List links and history stats

@@ -90,6 +90,26 @@ impl KeyStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    // --- Settings ---
+
+    pub fn get_setting(&self, key: &str) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .ok()
+    }
+
+    pub fn set_setting(&mut self, key: &str, value: &str) -> Result<(), Error> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     // --- Boosts ---
 
     pub fn add_boost(&mut self, path: &Path, multiplier: f64) -> Result<(), Error> {
@@ -244,7 +264,7 @@ impl KeyStore {
                 } else {
                     visits as f64 * decay
                 };
-                let score = frecency_score + match_quality_bonus(&basename_lower, &query_lower);
+                let score = frecency_score + match_quality_tiebreak(&basename_lower, &query_lower);
                 SearchResult {
                     path,
                     score,
@@ -303,7 +323,7 @@ impl KeyStore {
                 } else {
                     visits as f64 * decay
                 };
-                let score = frecency_score + match_quality_bonus(&basename_lower, &last_kw);
+                let score = frecency_score + match_quality_tiebreak(&basename_lower, &last_kw);
                 SearchResult {
                     path,
                     score,
@@ -518,11 +538,23 @@ pub enum ResultSource {
     Filesystem,
 }
 
-pub fn match_quality_bonus(basename_lower: &str, query_lower: &str) -> f64 {
+/// Tiebreaker added to a *history* dir's frecency score: among dirs the user has
+/// used equally often, an exact basename match edges out a mere prefix match, and a
+/// prefix match edges out a loose substring match. Deliberately kept far below a
+/// single visit step (`1 * min_decay 0.25 = 0.25`), so it can NEVER reorder dirs
+/// that differ in selection/visit count — usage history decides the order, name
+/// match only breaks otherwise-exact ties. Mirrors the `HISTORY_MATCH_TIEBREAK`
+/// discipline already used in the fuzzy/typo fallbacks (see commands/jump.rs).
+///
+/// Previously this added a full +10000 (exact) / +500 (prefix), which let match
+/// quality swamp the pick count: a prefix match like `qwen2api-rs` could never
+/// overtake an exact `qwen2api` no matter how many times it was selected (it would
+/// have needed ~950 more selections to close the 9500-point gap).
+pub fn match_quality_tiebreak(basename_lower: &str, query_lower: &str) -> f64 {
     if basename_lower == query_lower {
-        10000.0
+        0.01
     } else if basename_lower.starts_with(query_lower) {
-        500.0
+        0.005
     } else {
         0.0
     }
@@ -553,6 +585,10 @@ fn init_schema(conn: &Connection) -> Result<(), Error> {
         CREATE TABLE IF NOT EXISTS boosts (
             path TEXT PRIMARY KEY,
             multiplier REAL NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
         );",
     )?;
     Ok(())

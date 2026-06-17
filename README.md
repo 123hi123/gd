@@ -176,6 +176,7 @@ gd update               rebuild and restart (developers)
 **Never the wrong guess**
 
 - **You choose, gd suggests** — when several directories match, an interactive TUI picker lets you pick the right one; gd never silently jumps somewhere wrong.
+- **Best match where your eyes rest** — the picker opens inline right where you typed, with the top result on the very line your cursor is on and the rest flowing downward, so your gaze never has to move. Prefer a full-screen list? `gd config layout traditional` (or `centered`).
 - **No dead ends** — paths that no longer exist are filtered out at query time, so you're never offered a folder that's already gone.
 - **`cd`, only better** — local `./src`, absolute `/paths`, `../relative`, `gd -`, and bare `gd` for home all still work. Alias `cd=gd` and lose nothing.
 

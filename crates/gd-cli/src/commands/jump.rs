@@ -5,6 +5,32 @@ use nucleo_matcher::{Config, Matcher};
 use std::path::{Path, PathBuf};
 use std::process;
 
+/// Weight applied to the nucleo match score when scoring *history* dirs in the
+/// fuzzy fallbacks. Every dir surfaced here is already a loose match, so usage
+/// history decides the order — match quality is only a tiebreaker (see "Search
+/// priority" in CLAUDE.md: selected/visited history is ranked by count). nucleo
+/// totals run ~0..500; this keeps their contribution below a single-visit
+/// frecency step (`0.5 * min_decay 0.25 = 0.125`), so a more-used dir can never
+/// be displaced by a slightly better-matching but less-used one.
+const HISTORY_MATCH_TIEBREAK: f64 = 0.0001;
+
+/// Frecency floor for a history dir in the fuzzy / typo fallbacks, encoding the
+/// ranking tiers from CLAUDE.md: a *selected* dir lands in the top band (ranked
+/// by selection count), a *visited-but-never-selected* dir lands in a middle
+/// band that still outranks every filesystem/index match (which top out around
+/// the low tens before boosts). Match quality is added separately as a small
+/// tiebreaker, so it never reorders these bands.
+#[allow(clippy::cast_precision_loss)]
+fn history_base(selections: u64, visits: u64, decay: f64) -> f64 {
+    const SELECTED_TIER: f64 = 100_000.0;
+    const VISITED_TIER: f64 = 1_000.0;
+    if selections > 0 {
+        SELECTED_TIER + (selections as f64 * 10.0 + visits as f64) * decay
+    } else {
+        VISITED_TIER + visits as f64 * decay
+    }
+}
+
 pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
     let keywords: Vec<&str> = query.split_whitespace().collect();
 
@@ -77,7 +103,9 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
             })
             .collect::<Vec<_>>();
 
-        match crate::tui::pick(query, &candidates)? {
+        let mode = crate::tui::LayoutMode::from_setting(store.get_setting("layout").as_deref());
+        let lang = crate::i18n::Lang::resolve(store.get_setting("language").as_deref());
+        match crate::tui::pick(query, &candidates, mode, lang)? {
             Some(path) => path,
             None => process::exit(130),
         }
@@ -251,16 +279,10 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 if score > 0 {
                     let decay =
                         gd_core::frecency::decay_factor(now.saturating_sub(entry.last_access));
-                    const SELECTED_TIER: f64 = 100_000.0;
-                    let base = if entry.selections > 0 {
-                        SELECTED_TIER
-                            + (entry.selections as f64 * 10.0 + entry.visits as f64) * decay
-                    } else {
-                        entry.visits as f64 * decay
-                    };
+                    let base = history_base(entry.selections, entry.visits, decay);
                     results.push(SearchResult {
                         path: path.clone(),
-                        score: base * 0.5 + f64::from(score),
+                        score: base * 0.5 + f64::from(score) * HISTORY_MATCH_TIEBREAK,
                         source: ResultSource::History,
                     });
                 }
@@ -316,13 +338,7 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
             {
                 let decay =
                     gd_core::frecency::decay_factor(now.saturating_sub(entry.last_access));
-                const SELECTED_TIER: f64 = 100_000.0;
-                let base = if entry.selections > 0 {
-                    SELECTED_TIER
-                        + (entry.selections as f64 * 10.0 + entry.visits as f64) * decay
-                } else {
-                    entry.visits as f64 * decay
-                };
+                let base = history_base(entry.selections, entry.visits, decay);
                 // soft-AND: partial matches (matched < keywords) are allowed from
                 // history only, demoted by (matched / total)^2 so a full match always
                 // outranks a partial one.
@@ -333,7 +349,7 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 };
                 results.push(SearchResult {
                     path: path.clone(),
-                    score: (base * 0.5 + f64::from(total_score)) * penalty,
+                    score: (base * 0.5 + f64::from(total_score) * HISTORY_MATCH_TIEBREAK) * penalty,
                     source: ResultSource::History,
                 });
             }
@@ -498,15 +514,10 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
             let max_len = query_joined.len().max(basename.len());
             let sim = 1.0 - (dist as f64 / max_len as f64);
             let decay = gd_core::frecency::decay_factor(now.saturating_sub(entry.last_access));
-            const SELECTED_TIER: f64 = 100_000.0;
-            let base = if entry.selections > 0 {
-                SELECTED_TIER + (entry.selections as f64 * 10.0 + entry.visits as f64) * decay
-            } else {
-                entry.visits as f64 * decay
-            };
+            let base = history_base(entry.selections, entry.visits, decay);
             results.push(SearchResult {
                 path: path.clone(),
-                score: base * sim * 0.3,
+                score: base * 0.3 + sim * HISTORY_MATCH_TIEBREAK,
                 source: ResultSource::History,
             });
         }
