@@ -42,10 +42,12 @@ fn is_excluded(path: &std::path::Path) -> bool {
 }
 
 fn main() -> Result<()> {
-    let running = Arc::new(AtomicBool::new(true));
-    let r = running.clone();
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, r.clone())?;
-    signal_hook::flag::register(signal_hook::consts::SIGINT, r)?;
+    // flag::register 只會把旗標設成 true，所以旗標語意必須是「收到終止訊號」。
+    // 若寫成「還在執行中」(初始 true)，handler 會退化成 no-op，卻又蓋掉 SIGTERM
+    // 的預設終止行為 → 進程完全免疫 SIGTERM，只能等 systemd 補 SIGKILL。
+    let term = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&term))?;
+    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&term))?;
 
     let home = dirs::home_dir().context("cannot determine home directory")?;
     let data_dir = dirs::data_dir()
@@ -112,7 +114,7 @@ fn main() -> Result<()> {
             CATCHUP_INTERVAL_SECS,
             FULLSCAN_INTERVAL_SECS / 3600
         );
-        polling_loop(&running, &home, &index);
+        polling_loop(&term, &home, &index);
         if let Err(e) = index.flush() {
             eprintln!("gd-daemon: final flush error: {e}");
         }
@@ -128,7 +130,7 @@ fn main() -> Result<()> {
     // Event loop
     let mut last_flush = Instant::now();
 
-    while running.load(Ordering::Relaxed) {
+    while !term.load(Ordering::Relaxed) {
         match fan::poll_events(fan_fd, 2000) {
             Ok(true) => {
                 let events = fan::read_events(fan_fd, mount_fd);
@@ -190,7 +192,7 @@ const FULLSCAN_INTERVAL_SECS: u64 = 6 * 3600;
 /// fanotify 不可用（如 btrfs）時的降級模式：
 /// 每 CATCHUP_INTERVAL_SECS 以 mtime 補新目錄；rename/刪除靠每
 /// FULLSCAN_INTERVAL_SECS 的 full_scan（含 cleanup_stale）補正。
-fn polling_loop(running: &AtomicBool, home: &std::path::Path, index: &PathIndex) {
+fn polling_loop(term: &AtomicBool, home: &std::path::Path, index: &PathIndex) {
     let now_secs = || {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -202,7 +204,7 @@ fn polling_loop(running: &AtomicBool, home: &std::path::Path, index: &PathIndex)
     let mut last_catchup = Instant::now();
     let mut last_fullscan = Instant::now();
 
-    while running.load(Ordering::Relaxed) {
+    while !term.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_secs(2));
 
         if last_fullscan.elapsed().as_secs() >= FULLSCAN_INTERVAL_SECS {

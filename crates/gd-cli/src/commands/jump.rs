@@ -32,6 +32,30 @@ fn history_base(selections: u64, visits: u64, decay: f64) -> f64 {
 }
 
 pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
+    // A query containing '/' is a filesystem path, not a basename search (gd
+    // only ever matches basenames). Resolve it directly, *before* splitting into
+    // keywords — otherwise a path with a space (e.g. "qwen 協議/foo") splits into
+    // >1 keyword, skips this branch, and falls through to a fuzzy search that can
+    // never match a full path.
+    if query.contains('/') {
+        let path = PathBuf::from(query);
+        let resolved = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        };
+        if resolved.is_dir() {
+            let target = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+            store.record_selection(&target);
+            store.save()?;
+            println!("{}", target.display());
+        } else {
+            eprintln!("gd: not a directory: {query}");
+            process::exit(1);
+        }
+        return Ok(());
+    }
+
     let keywords: Vec<&str> = query.split_whitespace().collect();
 
     if keywords.len() <= 1 {
@@ -42,25 +66,6 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
                 println!("{}", path.display());
                 return Ok(());
             }
-        }
-
-        if query.contains('/') {
-            let path = PathBuf::from(query);
-            let resolved = if path.is_absolute() {
-                path
-            } else {
-                std::env::current_dir().unwrap_or_default().join(path)
-            };
-            if resolved.is_dir() {
-                let target = std::fs::canonicalize(&resolved).unwrap_or(resolved);
-                store.record_selection(&target);
-                store.save()?;
-                println!("{}", target.display());
-            } else {
-                eprintln!("gd: not a directory: {query}");
-                process::exit(1);
-            }
-            return Ok(());
         }
 
         if let Ok(cwd) = std::env::current_dir() {
@@ -91,6 +96,7 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
     }
 
     dedup_results(&mut results);
+    apply_cwd_proximity(&mut results, keywords.len() <= 1);
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     let selected = if is_interactive() {
@@ -595,6 +601,68 @@ fn scan_fd_fallback(query: &str) -> Vec<PathBuf> {
 fn dedup_results(results: &mut Vec<SearchResult>) {
     let mut seen = std::collections::HashSet::new();
     results.retain(|r| seen.insert(r.path.clone()));
+}
+
+/// Current-directory proximity boost (plus a freshly-created floor).
+///
+/// A result that lives *under* the directory the user is standing in is almost
+/// always more relevant than an equally-named dir elsewhere ("I'm in this project
+/// right now, so its `src` beats some other project's `src`"). Lift every strict
+/// descendant of the cwd to ~1.5 selections — between a once-selected dir (100_010)
+/// and a twice-selected one (100_020); see the SELECTED_TIER math in db.rs /
+/// `history_base`. So a fresh cwd-descendant outranks a dir selected once elsewhere,
+/// but an established habit (selected ≥2×) still wins.
+///
+/// Uses `.max` (a floor, not an add) so a cwd-descendant that already carries richer
+/// history keeps its real, higher score and is never dragged down. No decay is
+/// applied: "I am standing here right now" is itself the freshest possible signal.
+///
+/// **Freshly-created floor.** When the query is a *single keyword* (a weak,
+/// "you-know-what-I-mean" signal) and a cwd-descendant was created/touched within
+/// the last few minutes, lift it all the way to `FRESH_TIER` — above any realistic
+/// selection history, below only an explicit `gd link`. This is the "`md foo`, then
+/// immediately `gd f` to jump in" case: the just-made `foo` should win over some old
+/// `f*` habit. The signal is *recency*, not query length, so it self-expires (an
+/// hour later `foo` ranks by its real history again) and a multi-keyword — i.e. more
+/// specific — query never triggers it. Cost is a single `stat()` on the handful of
+/// cwd-descendants already in the result set.
+fn apply_cwd_proximity(results: &mut [SearchResult], single_keyword: bool) {
+    // 100_000 (SELECTED_TIER) + 15 == 1.5 selection steps of 10 each.
+    const CWD_PROXIMITY: f64 = 100_015.0;
+    // Above the whole selection tier (100_000 + selections*10*decay, realistically a
+    // few thousand at most) yet below an explicit link (f64::MAX). "I made this
+    // seconds ago and I'm standing in its parent" is the strongest signal short of an
+    // alias.
+    const FRESH_TIER: f64 = 200_000.0;
+    // How recently a dir must have been created/touched to count as "fresh".
+    const FRESH_WINDOW_SECS: u64 = 300; // 5 minutes
+
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let now = gd_core::frecency::now_secs();
+    for r in results.iter_mut() {
+        if r.path != cwd && r.path.starts_with(&cwd) {
+            r.score = r.score.max(CWD_PROXIMITY);
+            if single_keyword {
+                if let Some(age) = dir_age_secs(&r.path, now) {
+                    if age <= FRESH_WINDOW_SECS {
+                        r.score = r.score.max(FRESH_TIER);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Seconds elapsed since `path`'s directory mtime, or `None` if it can't be read
+/// or its mtime is in the future (clock skew). A just-`mkdir`'d dir has mtime ≈ now,
+/// so a small age is a cheap "freshly created" proxy without touching the DB schema.
+fn dir_age_secs(path: &Path, now: u64) -> Option<u64> {
+    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+    let mtime_secs = mtime.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    now.checked_sub(mtime_secs)
 }
 
 fn is_interactive() -> bool {
