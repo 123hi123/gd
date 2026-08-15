@@ -183,7 +183,7 @@ gd update               重新編譯並重啟（開發者用）
 **輕量、隱形的基礎建設**
 
 - **索引永遠新鮮** — fanotify 監聽器即時追蹤建立、刪除、搬移。不跑定期 `find` 掃描，不會給你過期結果。
-- **不擋你的路** — 約 15 MB 記憶體、每運行一小時只花約 7 秒 CPU、查詢 < 25 ms。事件驅動，從不輪詢。
+- **不擋你的路** — 約 15 MB 記憶體、每運行一小時只花約 7 秒 CPU、查詢 < 25 ms。只要核心允許，就是事件驅動。
 - **單一安全儲存** — daemon 與 CLI 共用一個 SQLite 資料庫（WAL 模式）：可並發、一致、不會損毀。
 
 ## 架構
@@ -204,6 +204,10 @@ gd update               重新編譯並重啟（開發者用）
 ```
 
 **gd-daemon** 透過 Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) 即時監聯檔案系統變化，目錄的建立、刪除、搬移都是增量追蹤——不需要定期全量掃描。Daemon 與 CLI 共用一個 SQLite 資料庫，以 WAL 模式安全並發存取。
+
+**自我修復。** kernel 事件佇列若被塞爆（超大的 `npm install`、`rm -rf` 洪水），daemon 會偵測到 `FAN_Q_OVERFLOW` 標記，等洪水過去後補跑一次 catchup——不需要任何定期重掃。已消失的路徑會在搜尋第一次碰到它們時順手從索引退場（`gd clean` 可隨時做徹底清掃）。
+
+**降級模式。** 有些檔案系統掛不上 fanotify 的 FID mark——最常見的是切成子卷的 btrfs 家目錄（核心會以 `EXDEV` 拒絕）——此時 daemon 會降級成每 30 分鐘一次的 catchup 補掃，以閒置（idle）CPU/IO 優先權執行，保證不跟前景工作搶資源；沒有定期全掃，因為死路徑已由查詢時順手退場處理。降級期間每 30 分鐘重試一次 fanotify，成功就無縫切回事件驅動。`gd setup` 裝完會當場回報實際的監看模式，`gd doctor` 隨時可查；`gd config daemon.fallback off` 可以完全關閉背景掃描（索引改為只靠你實際造訪過的目錄成長）。
 
 | | |
 |---|---|

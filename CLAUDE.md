@@ -43,3 +43,18 @@ systemctl --user start gd-daemon
 - Query latency: <25ms
 - Search matches **basename only**, not full path
 - fanotify requires CAP_SYS_ADMIN + CAP_DAC_READ_SEARCH on gd-daemon binary
+- fanotify unavailable (e.g. btrfs subvolume home → EXDEV): daemon degrades to
+  a catchup rescan every 30 min at idle CPU/IO priority and retries fanotify
+  every 30 min. `gd config daemon.fallback off` disables scanning entirely.
+  NEVER shorten these intervals: a "catchup" is a full-tree walk (mtime cannot
+  prune the walk — a new dir only touches its direct parent's mtime), so
+  frequent catchups = constant whole-$HOME readdir storms that fight the
+  foreground for IO and page cache.
+- No periodic full rescan anywhere. Dead paths retire lazily at query time
+  (`retire_missing`: index-only rows deleted, history rows marked out-of-index;
+  `gd clean` for a full sweep). Event-mode gaps are self-healing: FAN_Q_OVERFLOW
+  triggers one catchup after the burst settles (≥5 min apart); startup catchup
+  covers daemon downtime (skipped when downtime < 60 s, so `gd update` restarts
+  don't walk the tree). Scans are rare, so they run fast (parallelism =
+  min(cores, 8)) — the idle scheduling class in the unit is what keeps them
+  invisible, not artificial slowness.

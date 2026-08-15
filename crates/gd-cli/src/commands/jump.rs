@@ -99,6 +99,14 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
     apply_cwd_proximity(&mut results, keywords.len() <= 1);
     results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
+    // 端出去之前驗證前段結果的存在性,死路徑順手從 DB 退場(lazy 修正)。
+    prune_dead_top(store, &mut results, 50);
+
+    if results.is_empty() {
+        eprintln!("gd: no matches for '{query}'.");
+        process::exit(3);
+    }
+
     let selected = if is_interactive() {
         let candidates = results
             .iter()
@@ -119,11 +127,38 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
         results[0].path.clone()
     };
 
+    // prune 只驗前段;深處撈出來的、或 TUI 停留期間被刪掉的(競態)在
+    // 這裡把關:退場 + 明確報錯,而不是讓 shell cd 去撞牆。
+    if !selected.exists() {
+        store.retire_missing(&selected);
+        eprintln!("gd: directory no longer exists: {}", selected.display());
+        process::exit(1);
+    }
+
     store.record_selection(&selected);
     store.save()?;
 
     println!("{}", selected.display());
     Ok(())
+}
+
+/// 只驗證排序後前 `k` 名的存在性 — stat 成本只花在「真的會端給使用者」的
+/// 結果上,絕不掃整個 DB。驗到的死路徑當場 `retire_missing`(順手修正)。
+/// 排在 k 名之後的不驗,由選取時的最終檢查把關。
+fn prune_dead_top(store: &KeyStore, results: &mut Vec<SearchResult>, k: usize) {
+    let mut live = 0usize;
+    results.retain(|r| {
+        if live >= k {
+            return true;
+        }
+        if r.path.exists() {
+            live += 1;
+            true
+        } else {
+            store.retire_missing(&r.path);
+            false
+        }
+    });
 }
 
 fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
@@ -276,6 +311,7 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
         for (path, entry) in store.all_history() {
             if !path.exists() {
+                store.retire_missing(&path);
                 continue;
             }
             let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -336,6 +372,7 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
         for (path, entry) in store.all_history() {
             if !path.exists() {
+                store.retire_missing(&path);
                 continue;
             }
             let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -508,6 +545,7 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
     for (path, entry) in store.all_history() {
         if !path.exists() {
+            store.retire_missing(&path);
             continue;
         }
         let basename = path

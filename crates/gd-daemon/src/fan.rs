@@ -8,11 +8,13 @@ const FAN_REPORT_DIR_FID: u32 = 0x0000_0400;
 const FAN_REPORT_NAME: u32 = 0x0000_0800;
 const FAN_MARK_ADD: u32 = 0x0000_0001;
 const FAN_MARK_FILESYSTEM: u32 = 0x0000_0100;
-const FAN_MARK_MOUNT: u32 = 0x0000_0010;
 const FAN_CREATE: u64 = 0x0000_0100;
 const FAN_DELETE: u64 = 0x0000_0200;
 const FAN_RENAME: u64 = 0x1000_0000;
 const FAN_ONDIR: u64 = 0x4000_0000;
+/// Kernel 事件佇列滿(預設 16384 筆)時塞進來的溢位通知:代表有事件被
+/// 丟掉了,索引已與檔案系統脫鉤,呼叫端必須排一次 catchup 補救。
+const FAN_Q_OVERFLOW: u64 = 0x0000_0020;
 
 const EVENT_METADATA_LEN: usize = 24;
 const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
@@ -57,6 +59,13 @@ pub fn open_mount_fd(path: &Path) -> io::Result<i32> {
     Ok(fd)
 }
 
+/// 在 path 所在的 superblock 掛 FID 模式 mark。
+///
+/// 失敗就是失敗,沒有退路:FID 模式的 group 不允許 FAN_MARK_MOUNT
+/// (必回 EINVAL),而 dirent 事件(FAN_CREATE/DELETE/RENAME)又必須
+/// FID 模式 — 舊版在這裡退試 mount mark 是永遠 EINVAL 的死碼。
+/// 失敗原因由呼叫端分類(EXDEV = btrfs 子卷、EPERM = 缺 capability)
+/// 並決定降級策略。
 pub fn mark_filesystem(fd: i32, path: &Path) -> io::Result<()> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -64,26 +73,14 @@ pub fn mark_filesystem(fd: i32, path: &Path) -> io::Result<()> {
     let mask = FAN_CREATE | FAN_DELETE | FAN_RENAME | FAN_ONDIR;
 
     let ret = unsafe {
-        let r = libc::syscall(
+        libc::syscall(
             libc::SYS_fanotify_mark,
             fd,
             FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
             mask,
             libc::AT_FDCWD,
             c_path.as_ptr(),
-        ) as i32;
-        if r < 0 {
-            libc::syscall(
-                libc::SYS_fanotify_mark,
-                fd,
-                FAN_MARK_ADD | FAN_MARK_MOUNT,
-                mask,
-                libc::AT_FDCWD,
-                c_path.as_ptr(),
-            ) as i32
-        } else {
-            r
-        }
+        ) as i32
     };
 
     if ret < 0 {
@@ -105,10 +102,13 @@ pub fn poll_events(fd: i32, timeout_ms: i32) -> io::Result<bool> {
     Ok(ret > 0)
 }
 
-pub fn read_events(fd: i32, mount_fd: i32) -> Vec<DirEvent> {
+/// 讀出佇列中的目錄事件。回傳 `(events, overflow)`:`overflow = true` 表示
+/// kernel 曾丟事件(FAN_Q_OVERFLOW),事件流有破口,需要補掃。
+pub fn read_events(fd: i32, mount_fd: i32) -> (Vec<DirEvent>, bool) {
     unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
 
     let mut events = Vec::new();
+    let mut overflow = false;
     let mut buf = [0u8; 16384];
 
     loop {
@@ -132,6 +132,10 @@ pub fn read_events(fd: i32, mount_fd: i32) -> Vec<DirEvent> {
             let mask = u64::from_ne_bytes(
                 buf[offset + 8..offset + 16].try_into().unwrap(),
             );
+
+            if mask & FAN_Q_OVERFLOW != 0 {
+                overflow = true;
+            }
 
             if mask & FAN_ONDIR != 0 {
                 let info_start = offset + EVENT_METADATA_LEN;
@@ -182,7 +186,7 @@ pub fn read_events(fd: i32, mount_fd: i32) -> Vec<DirEvent> {
     }
 
     unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };
-    events
+    (events, overflow)
 }
 
 fn parse_dfid_name(info_buf: &[u8], mount_fd: i32) -> Option<PathBuf> {

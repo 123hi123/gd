@@ -1,6 +1,10 @@
 [Unit]
 Description=gd directory jump daemon
 After=default.target
+# 病態保險:若 daemon 反覆啟動後才掛掉,每次啟動的 catchup 就會變成
+# 「每 5 秒一次全樹走訪」的重啟迴圈 — 10 分鐘內失敗 10 次就停手。
+StartLimitIntervalSec=600
+StartLimitBurst=10
 
 [Service]
 Type=simple
@@ -8,6 +12,12 @@ ExecStart=%h/.cargo/bin/gd-daemon
 Restart=on-failure
 RestartSec=5
 Environment=HOME=%h
+# 背景索引不准跟前景搶資源:CPU 與 I/O 都只用真正閒置的部分。
+# 這在 fanotify 降級成輪詢掃描的機器上尤其重要(如 btrfs 子卷的家目錄)。
+Nice=19
+CPUSchedulingPolicy=idle
+IOSchedulingClass=idle
+MemoryHigh=64M
 
 [Install]
 WantedBy=default.target

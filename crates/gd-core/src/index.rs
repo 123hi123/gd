@@ -49,6 +49,34 @@ impl PathIndex {
         }
     }
 
+    /// 只在「索引裡缺席」時才寫入:不存在的路徑 INSERT;存在但
+    /// in_index = 0 的列(曾被刪除/移出、因留有歷史而保住的)修回 1;
+    /// 其餘情況零寫入 — 不碰列、不長 WAL。回傳是否有實際變更。
+    ///
+    /// 給降級模式的 catchup 用:全樹補掃時,每個已索引目錄的成本是
+    /// 一次 B-tree 主鍵探測(讀),而不是一次 upsert(寫),WAL 才不會
+    /// 每輪被幾十萬筆無效寫入撐大再 checkpoint。
+    pub fn add_if_missing(&self, path: PathBuf) -> bool {
+        let path_str = path.to_string_lossy();
+        let basename_lower = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if let Ok(mut stmt) = self.conn.prepare_cached(
+            "INSERT INTO dirs (path, basename_lower, in_index)
+             VALUES (?1, ?2, 1)
+             ON CONFLICT(path) DO UPDATE SET in_index = 1
+             WHERE dirs.in_index = 0",
+        ) {
+            return stmt
+                .execute(params![path_str.as_ref(), basename_lower])
+                .map(|n| n > 0)
+                .unwrap_or(false);
+        }
+        false
+    }
+
     pub fn remove(&self, path: &Path) {
         let path_str = path.to_string_lossy();
         if let Ok(mut stmt) = self.conn.prepare_cached(

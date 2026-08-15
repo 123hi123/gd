@@ -6,14 +6,22 @@ use std::process::Command;
 
 const SERVICE_CONTENT: &str = include_str!("../shell/gd-daemon.service");
 
-pub fn run() -> Result<()> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-
-    // 1. Install systemd user service
+/// 寫入(或覆寫)systemd user unit。`gd setup` 與 `gd update` 共用:
+/// unit 裡的資源限制(Nice/IOSchedulingClass 等)也是程式的一部分,
+/// 更新 binary 時必須一起跟上。
+pub fn install_service_unit(home: &std::path::Path) -> Result<PathBuf> {
     let service_dir = home.join(".config/systemd/user");
     fs::create_dir_all(&service_dir)?;
     let service_path = service_dir.join("gd-daemon.service");
     fs::write(&service_path, SERVICE_CONTENT)?;
+    Ok(service_path)
+}
+
+pub fn run() -> Result<()> {
+    let home = dirs::home_dir().context("cannot determine home directory")?;
+
+    // 1. Install systemd user service
+    let service_path = install_service_unit(&home)?;
     eprintln!("installed {}", service_path.display());
 
     // 2. Set CAP_SYS_ADMIN on daemon binary
@@ -42,7 +50,10 @@ pub fn run() -> Result<()> {
         .status();
 
     match enable {
-        Ok(s) if s.success() => eprintln!("gd-daemon service enabled and started."),
+        Ok(s) if s.success() => {
+            eprintln!("gd-daemon service enabled and started.");
+            report_watch_mode();
+        }
         _ => eprintln!("warning: could not enable service. Try:\n  systemctl --user enable --now gd-daemon"),
     }
 
@@ -74,6 +85,49 @@ pub fn run() -> Result<()> {
     eprintln!("setup complete. Restart your shell or run: exec {shell}");
 
     Ok(())
+}
+
+/// 裝完不能只說 setup complete:fanotify 掛不掛得上是機器性質(btrfs 子卷
+/// 家目錄就是掛不上),使用者必須「當場」知道 daemon 實際跑在哪個模式,
+/// 而不是日後從 iotop 發現它在降級掃描。daemon 一啟動就寫 daemon.mode
+/// (早於首次建索引),這裡最多等 5 秒再回報;之後隨時可用 gd doctor 查。
+fn report_watch_mode() {
+    let mode_file = dirs::data_dir()
+        .unwrap_or_default()
+        .join("gd")
+        .join("daemon.mode");
+
+    let mut mode = String::new();
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        if let Ok(m) = fs::read_to_string(&mode_file) {
+            let m = m.trim().to_string();
+            if !m.is_empty() {
+                mode = m;
+                break;
+            }
+        }
+    }
+
+    match mode.as_str() {
+        "fanotify" => eprintln!("watch mode: fanotify — event-driven, no background scanning."),
+        "poll" => eprintln!(
+            "watch mode: DEGRADED — fanotify is unavailable on this filesystem \
+             (btrfs subvolume homes are the usual cause).\n  \
+             The daemon will instead rescan at idle priority every 30 min \
+             and keep retrying fanotify.\n  \
+             Details:           journalctl --user -u gd-daemon\n  \
+             Disable scanning:  gd config daemon.fallback off"
+        ),
+        "off" => eprintln!(
+            "watch mode: fanotify unavailable; background scanning disabled \
+             (daemon.fallback=off) — the index grows only from your shell visits."
+        ),
+        _ => eprintln!(
+            "watch mode: not reported yet (the first index build may still be \
+             running) — check later with: gd doctor"
+        ),
+    }
 }
 
 fn detect_current_shell() -> String {

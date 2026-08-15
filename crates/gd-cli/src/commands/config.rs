@@ -51,6 +51,22 @@ pub const KNOWN: &[Setting] = &[
         help_en: "language for the picker and this config screen",
         help_zh: "目錄選單與這個設定畫面的語言",
     },
+    Setting {
+        key: "daemon.fallback",
+        allowed: &["poll", "off"],
+        default: "poll",
+        help_en: "what gd-daemon does when fanotify is unavailable (e.g. a btrfs \
+                  subvolume home) — poll: catchup rescan at idle priority every \
+                  30 min to find new dirs (dead paths retire lazily at query \
+                  time; `gd clean` for a full sweep); off: never scan, the index \
+                  grows only from your shell visits. Applies after: \
+                  systemctl --user restart gd-daemon",
+        help_zh: "fanotify 不可用(例如 btrfs 子卷的家目錄)時 daemon 的行為 — \
+                  poll:每 30 分鐘一次閒置優先權的 catchup 補新目錄(死路徑由\
+                  查詢時順手退場,`gd clean` 做徹底清掃);off:完全不掃描,\
+                  索引只靠 shell hook 記錄的目錄成長。改完執行:\
+                  systemctl --user restart gd-daemon",
+    },
 ];
 
 pub fn lookup(key: &str) -> Option<&'static Setting> {

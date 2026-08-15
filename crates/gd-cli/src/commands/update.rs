@@ -43,6 +43,17 @@ pub fn run() -> Result<()> {
         _ => eprintln!("warning: setcap failed. Run: sudo setcap cap_sys_admin,cap_dac_read_search+ep {}", daemon_bin.display()),
     }
 
+    // Refresh the systemd unit (resource limits travel with the binary)
+    match crate::commands::setup::install_service_unit(&home) {
+        Ok(p) => {
+            eprintln!("refreshed {}", p.display());
+            let _ = Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+        }
+        Err(e) => eprintln!("warning: could not refresh service unit: {e}"),
+    }
+
     // Restart daemon — it will do a catchup scan, not full scan
     eprintln!("restarting gd-daemon...");
     let _ = Command::new("systemctl")

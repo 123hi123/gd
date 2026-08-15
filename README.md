@@ -183,7 +183,7 @@ gd update               rebuild and restart (developers)
 **Invisible, lightweight infrastructure**
 
 - **Always-fresh index** — a fanotify watcher tracks creates, deletes, and moves in real time. No periodic `find` scans, no stale results.
-- **Stays out of your way** — ~15 MB RAM, ~7 s of CPU per hour of uptime, < 25 ms queries. Event-driven, never polling.
+- **Stays out of your way** — ~15 MB RAM, ~7 s of CPU per hour of uptime, < 25 ms queries. Event-driven wherever the kernel allows it.
 - **One safe store** — daemon and CLI share a single SQLite database in WAL mode: concurrent, consistent, corruption-free.
 
 ## Architecture
@@ -204,6 +204,10 @@ gd update               rebuild and restart (developers)
 ```
 
 **gd-daemon** uses Linux [fanotify](https://man7.org/linux/man-pages/man7/fanotify.7.html) to watch the filesystem in real-time. Directory creates, deletes, and moves are tracked incrementally — no periodic `find` scans. Both daemon and CLI share one SQLite database with WAL mode for safe concurrent access.
+
+**Self-healing.** If the kernel event queue ever overflows (a huge `npm install` or `rm -rf` burst), the daemon notices the `FAN_Q_OVERFLOW` marker and runs one catchup scan after the burst settles — no periodic rescans needed. Paths that stop existing retire from the index lazily, the first time a search touches them (`gd clean` does a full sweep on demand).
+
+**Fallback mode.** On filesystems where fanotify FID marks are unavailable — most commonly a btrfs home split into subvolumes (the kernel rejects the mark with `EXDEV`) — the daemon degrades to a catchup rescan every 30 minutes at idle CPU/IO priority, so it never competes with foreground work; there is no periodic full rescan, since dead paths already retire lazily at query time. It keeps retrying fanotify every 30 minutes and switches back seamlessly if it succeeds. `gd setup` reports the active watch mode right after install, `gd doctor` shows it any time, and `gd config daemon.fallback off` disables background scanning entirely (the index then grows only from the directories you actually visit).
 
 | | |
 |---|---|

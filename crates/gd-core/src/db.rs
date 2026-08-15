@@ -90,6 +90,26 @@ impl KeyStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// 查詢時發現路徑已不存在的「順手修正」:純索引列(無任何歷史)直接
+    /// 刪掉;帶歷史的列只標 in_index = 0 保留 — 它可能只是外接碟/網路掛載
+    /// 暫時不在,徹底清除是手動 `gd clean` 的職責。這讓死路徑第一次被查到
+    /// 就退場,索引不再依賴任何定期全掃來清屍體。
+    pub fn retire_missing(&self, path: &Path) {
+        let s = path.to_string_lossy();
+        self.conn
+            .execute(
+                "DELETE FROM dirs WHERE path = ?1 AND visits = 0 AND selections = 0",
+                params![s.as_ref()],
+            )
+            .ok();
+        self.conn
+            .execute(
+                "UPDATE dirs SET in_index = 0 WHERE path = ?1",
+                params![s.as_ref()],
+            )
+            .ok();
+    }
+
     // --- Settings ---
 
     pub fn get_setting(&self, key: &str) -> Option<String> {
