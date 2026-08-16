@@ -10,7 +10,7 @@ add-zsh-hook chpwd __gd_hook
 
 gd() {
     case "$1" in
-        link|unlink|list|clean|export|init|doctor|setup|update|boost|unboost|version|help|hook|"-h"|"--help"|"-V"|"--version")
+        link|unlink|config|list|clean|export|init|doctor|setup|update|boost|unboost|version|help|hook|"-h"|"--help"|"-V"|"--version")
             __gd_bin "$@"
             return $?
             ;;
@@ -22,7 +22,10 @@ gd() {
 
     local result
     result="$(__gd_bin "$@")" || return $?
-    [ -n "$result" ] && builtin cd -- "$result"
+    # 用明確的 if：沒有輸出就單純不跳轉，不要讓 test 的 false 變成函式的失敗狀態
+    if [ -n "$result" ]; then
+        builtin cd -- "$result"
+    fi
 }
 
 _gd() {
@@ -30,6 +33,7 @@ _gd() {
     subcmds=(
         'link:Link an alias to a path'
         'unlink:Remove a link'
+        'config:Get or set preferences'
         'list:List links and stats'
         'clean:Remove invalid entries'
         'export:Export database as JSON'

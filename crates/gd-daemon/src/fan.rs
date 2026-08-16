@@ -14,7 +14,11 @@ const FAN_RENAME: u64 = 0x1000_0000;
 const FAN_ONDIR: u64 = 0x4000_0000;
 /// Kernel 事件佇列滿(預設 16384 筆)時塞進來的溢位通知:代表有事件被
 /// 丟掉了,索引已與檔案系統脫鉤,呼叫端必須排一次 catchup 補救。
-const FAN_Q_OVERFLOW: u64 = 0x0000_0020;
+///
+/// 值取自 UAPI `linux/fanotify.h`:`#define FAN_Q_OVERFLOW 0x00004000`。
+/// 千萬別寫成 0x20 — 那是 FAN_OPEN,而我們的 mark mask 從不註冊 FAN_OPEN,
+/// 條件會恆為 false,補掃就成了死碼。
+const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
 
 const EVENT_METADATA_LEN: usize = 24;
 const FAN_EVENT_INFO_TYPE_DFID_NAME: u8 = 2;
@@ -173,9 +177,24 @@ pub fn read_events(fd: i32, mount_fd: i32) -> (Vec<DirEvent>, bool) {
                         (None, None) => {}
                     }
                 } else if let Some(path) = parse_dfid_name(info_buf, mount_fd) {
-                    if mask & FAN_CREATE != 0 {
+                    let created = mask & FAN_CREATE != 0;
+                    let deleted = mask & FAN_DELETE != 0;
+                    if created && deleted {
+                        // Kernel 會把同一個 (fsid, 父 file_handle, name) 且同一個
+                        // process 的連續事件 OR 進同一筆 mask。單一 process 內
+                        // mkdir + rmdir(mkdtemp、build tool 的暫存目錄)就會得到
+                        // FAN_ONDIR|FAN_DELETE|FAN_CREATE = 0x40000300。
+                        // 光看 bit 無法還原先後,只能實際看一眼:還在 = 建立,
+                        // 不在 = 刪除。只帶單一 bit 時不做這次 stat,事件洪水下
+                        // 每筆多一次 syscall 是實打實的成本。
+                        if path.is_dir() {
+                            events.push(DirEvent::Created(path));
+                        } else {
+                            events.push(DirEvent::Deleted(path));
+                        }
+                    } else if created {
                         events.push(DirEvent::Created(path));
-                    } else if mask & FAN_DELETE != 0 {
+                    } else if deleted {
                         events.push(DirEvent::Deleted(path));
                     }
                 }
@@ -185,6 +204,12 @@ pub fn read_events(fd: i32, mount_fd: i32) -> (Vec<DirEvent>, bool) {
         }
     }
 
+    // 直接寫 0 是安全的,不需要 F_GETFL 讀回來再清 bit:Linux 的 F_SETFL 只
+    // 動 O_APPEND|O_ASYNC|O_DIRECT|O_NOATIME|O_NONBLOCK 這幾個 bit,access
+    // mode(O_RDONLY)、O_LARGEFILE、O_CLOEXEC 都不受影響(fcntl(2))。而這個
+    // fd 是 fanotify_init 建的,第一個參數只給了
+    // FAN_CLASS_NOTIF|FAN_REPORT_DIR_FID|FAN_REPORT_NAME、沒有 FAN_NONBLOCK,
+    // 上面那五個 bit 本來就全是 0,所以寫 0 = 恢復原狀。
     unsafe { libc::fcntl(fd, libc::F_SETFL, 0) };
     (events, overflow)
 }

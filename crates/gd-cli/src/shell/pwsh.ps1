@@ -1,5 +1,5 @@
 function global:gd {
-    $info = @('link','unlink','list','clean','export','init','doctor','version','help','hook','-h','--help','-V','--version')
+    $info = @('link','unlink','config','list','clean','export','init','doctor','setup','update','boost','unboost','version','help','hook','-h','--help','-V','--version')
     if ($args.Count -gt 0 -and $args[0] -in $info) {
         & gd.exe @args
         return

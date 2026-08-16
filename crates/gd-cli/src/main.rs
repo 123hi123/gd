@@ -65,7 +65,9 @@ fn main() -> Result<()> {
         }
         Some(Command::Doctor) => {
             let store = KeyStore::open(data_dir)?;
-            commands::doctor::run(&store);
+            if !commands::doctor::run(&store, data_dir) {
+                std::process::exit(1);
+            }
             Ok(())
         }
         Some(Command::Setup) => {

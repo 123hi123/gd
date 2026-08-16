@@ -45,6 +45,12 @@ pub fn run() -> Result<()> {
         .args(["--user", "daemon-reload"])
         .status();
 
+    // daemon.mode 是上一任 daemon 留下的殘留檔,沒人會刪。啟動前先清掉,
+    // report_watch_mode() 讀到的才保證是「這次」啟動寫的:實測 unit 被
+    // ConditionPathExists 擋掉時 `systemctl enable --now` 仍回 exit 0,
+    // 不清就會拿舊檔去報一個根本沒起來的 daemon 的模式。
+    let _ = fs::remove_file(daemon_mode_path());
+
     let enable = Command::new("systemctl")
         .args(["--user", "enable", "--now", "gd-daemon"])
         .status();
@@ -91,11 +97,15 @@ pub fn run() -> Result<()> {
 /// 家目錄就是掛不上),使用者必須「當場」知道 daemon 實際跑在哪個模式,
 /// 而不是日後從 iotop 發現它在降級掃描。daemon 一啟動就寫 daemon.mode
 /// (早於首次建索引),這裡最多等 5 秒再回報;之後隨時可用 gd doctor 查。
-fn report_watch_mode() {
-    let mode_file = dirs::data_dir()
+fn daemon_mode_path() -> PathBuf {
+    dirs::data_dir()
         .unwrap_or_default()
         .join("gd")
-        .join("daemon.mode");
+        .join("daemon.mode")
+}
+
+fn report_watch_mode() {
+    let mode_file = daemon_mode_path();
 
     let mut mode = String::new();
     for _ in 0..20 {
@@ -124,8 +134,10 @@ fn report_watch_mode() {
              (daemon.fallback=off) — the index grows only from your shell visits."
         ),
         _ => eprintln!(
-            "watch mode: not reported yet (the first index build may still be \
-             running) — check later with: gd doctor"
+            "watch mode: not reported yet — the first index build may still be \
+             running, or the daemon did not actually start.\n  \
+             Check:  systemctl --user status gd-daemon\n  \
+             Later:  gd doctor"
         ),
     }
 }
@@ -227,14 +239,39 @@ fn install_cd_alias(rc: &std::path::Path, shell: &str) -> Result<()> {
     Ok(())
 }
 
+/// stdin 是不是 tty。README 主推的 `curl -sSL ... | install.sh | bash` 會讓
+/// stdin 變成 pipe,`read_line` 立刻回 Ok(0)(EOF)——舊版把它當成「按 Enter
+/// 接受預設」,使用者根本沒被問就被裝上 alias cd=gd。
+fn stdin_is_interactive() -> bool {
+    #[cfg(unix)]
+    {
+        unsafe { libc::isatty(0) != 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// `[Y/n]` 的回答。非互動(pipe / CI / EOF / 讀取失敗)一律回 false:
+/// 沒人在場回答時就不做有副作用的事。
 fn read_answer() -> bool {
+    if !stdin_is_interactive() {
+        eprintln!();
+        eprintln!("non-interactive input — skipping the cd alias (nothing was changed).");
+        eprintln!("  to enable it: run `gd setup` in a terminal, or add `alias cd=gd` to your shell rc");
+        return false;
+    }
+
     let stdin = io::stdin();
     let mut line = String::new();
-    if stdin.lock().read_line(&mut line).is_ok() {
-        let trimmed = line.trim().to_lowercase();
-        trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
-    } else {
-        true
+    match stdin.lock().read_line(&mut line) {
+        // Ok(0) 是 EOF:沒有答案,不能當成同意
+        Ok(0) | Err(_) => false,
+        Ok(_) => {
+            let trimmed = line.trim().to_lowercase();
+            trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+        }
     }
 }
 

@@ -40,8 +40,17 @@ systemctl --user start gd-daemon
 ## Constraints
 
 - Daemon RAM: ~15MB (SQLite-backed, no in-memory index)
-- Query latency: <25ms
+- Query latency (measured, 268k-row index): ~40 ms when the query hits, ~110 ms
+  through the typo fallback, ~300 ms when nothing matches at all. The fallbacks
+  scan every indexed basename in Rust, so their cost is linear in index size —
+  keep the index free of dead rows (`gd clean`) and it stays in this range.
+  The old "<25 ms" figure in this file was a target, never a measurement.
 - Search matches **basename only**, not full path
+- `in_index` means exactly one thing: **the daemon's index currently contains
+  this path**. It is NOT a "this path is dead" flag — a row the shell hook just
+  recorded is legitimately `in_index = 0` and alive. Never use it to decide
+  whether a path still exists; stat it. (`gd clean` used to get this wrong and
+  was consequently a no-op over 368k index rows.)
 - fanotify requires CAP_SYS_ADMIN + CAP_DAC_READ_SEARCH on gd-daemon binary
 - fanotify unavailable (e.g. btrfs subvolume home → EXDEV): daemon degrades to
   a catchup rescan every 30 min at idle CPU/IO priority and retries fanotify
@@ -58,3 +67,15 @@ systemctl --user start gd-daemon
   don't walk the tree). Scans are rare, so they run fast (parallelism =
   min(cores, 8)) — the idle scheduling class in the unit is what keeps them
   invisible, not artificial slowness.
+- Scans are interruptible and that has a consequence: a scan cut short by
+  SIGTERM writes `daemon.timestamp = 0` instead of the real time, so the next
+  start is guaranteed to run a catchup. Never "simplify" that back into an
+  unconditional `write_timestamp()` — a clean-looking timestamp over a
+  half-built index means the gap is never filled.
+- Deleting a directory removes its **whole subtree** from the index, not just
+  the one row. `rm -rf` loses the children's events (their paths are rebuilt
+  from the parent's file handle, and the parent is usually already gone by the
+  time the daemon drains the queue), so the parent's event has to clean up
+  after them. Subtree predicates use range bounds (`path >= 'p/' AND
+  path < 'p0'`), never `LIKE 'p/%'` — SQLite's case-insensitive LIKE cannot use
+  the primary-key index and degrades to a full table scan per event.

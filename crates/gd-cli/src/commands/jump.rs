@@ -142,23 +142,41 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
     Ok(())
 }
 
+/// 驗證存在性時最多 stat 幾次。死列很多的時候(實測一次查詢可以撞到近 4000
+/// 條死路徑)光是湊滿 `k` 個活結果就要 stat 幾千次,這在互動熱路徑上太貴。
+/// 上限到了就停止驗證,剩下的一律保留 —— 由使用者選取後的最終存在性檢查
+/// (run() 裡的 `!selected.exists()`)把關,真正選到死路徑仍然不會 cd 去撞牆。
+const MAX_PRUNE_STATS: usize = 300;
+
 /// 只驗證排序後前 `k` 名的存在性 — stat 成本只花在「真的會端給使用者」的
-/// 結果上,絕不掃整個 DB。驗到的死路徑當場 `retire_missing`(順手修正)。
-/// 排在 k 名之後的不驗,由選取時的最終檢查把關。
+/// 結果上,絕不掃整個 DB。排在 k 名之後、或超出 `MAX_PRUNE_STATS` 的不驗,
+/// 由選取時的最終檢查把關。
+///
+/// 驗到的死路徑先收集起來,迴圈結束後用 `retire_missing_batch` **一次交易**
+/// 寫回:逐筆 `retire_missing` 各自成交易,撞上 daemon 掃描的寫鎖時每一筆
+/// 都要吃一次 busy_timeout。
 fn prune_dead_top(store: &KeyStore, results: &mut Vec<SearchResult>, k: usize) {
     let mut live = 0usize;
+    let mut stats = 0usize;
+    let mut dead: Vec<PathBuf> = Vec::new();
+
     results.retain(|r| {
-        if live >= k {
+        if live >= k || stats >= MAX_PRUNE_STATS {
             return true;
         }
+        stats += 1;
         if r.path.exists() {
             live += 1;
             true
         } else {
-            store.retire_missing(&r.path);
+            dead.push(r.path.clone());
             false
         }
     });
+
+    if !dead.is_empty() {
+        store.retire_missing_batch(&dead);
+    }
 }
 
 fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
@@ -288,6 +306,65 @@ fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
     results
 }
 
+/// fallback 掃索引時最多留下幾筆。索引有 ~37 萬列,而 picker 最多也只看得到
+/// 前面幾十筆,把每個鬆散命中都具現成 Vec 是純浪費(實測打錯字的查詢 RSS
+/// 衝到 80MB、耗時 0.25s,全查不到更是 0.5s)。
+const FALLBACK_INDEX_LIMIT: usize = 200;
+
+/// 串流版的「只留分數最高的 N 筆」。超過 2N 就排一次序砍回 N,攤提下來是
+/// O(n) 且記憶體固定,不需要把整個索引具現化。
+struct TopN {
+    items: Vec<SearchResult>,
+    limit: usize,
+}
+
+impl TopN {
+    fn new(limit: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(limit * 2),
+            limit,
+        }
+    }
+
+    fn push(&mut self, r: SearchResult) {
+        self.items.push(r);
+        if self.items.len() >= self.limit * 2 {
+            self.trim();
+        }
+    }
+
+    fn trim(&mut self) {
+        self.items
+            .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        self.items.truncate(self.limit);
+    }
+
+    fn into_vec(mut self) -> Vec<SearchResult> {
+        self.trim();
+        self.items
+    }
+}
+
+/// 索引列的深度加分(離家目錄越淺越可能是使用者要的)。fuzzy / typo 兩個
+/// fallback 都用同一套規則,抽出來免得三份 copy-paste 走鐘。
+fn depth_bonus(path: &Path, home: Option<&PathBuf>, top: f64, ratio: f64) -> f64 {
+    let Some(h) = home else { return 0.0 };
+    let Ok(rel) = path.strip_prefix(h) else {
+        return 0.0;
+    };
+    let depth = rel.components().count();
+    if depth == 1 {
+        top
+    } else if depth <= 3 {
+        #[allow(clippy::cast_precision_loss)]
+        {
+            ratio / depth as f64
+        }
+    } else {
+        0.0
+    }
+}
+
 fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let now = gd_core::frecency::now_secs();
@@ -309,9 +386,11 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
         let pattern =
             Pattern::new(query, CaseMatching::Ignore, Normalization::Smart, AtomKind::Fuzzy);
 
+        // 死路徑先收集,迴圈跑完一次交易退場(逐筆各自成交易太貴)。
+        let mut dead: Vec<PathBuf> = Vec::new();
         for (path, entry) in store.all_history() {
             if !path.exists() {
-                store.retire_missing(&path);
+                dead.push(path);
                 continue;
             }
             let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -330,37 +409,31 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 }
             }
         }
+        if !dead.is_empty() {
+            store.retire_missing_batch(&dead);
+        }
 
         if store.has_index() {
-            for (path_str, basename) in store.all_index_entries() {
+            // 串流掃索引,只留 top-N:不要為了 fallback 把 37 萬列搬進記憶體。
+            let mut top = TopN::new(FALLBACK_INDEX_LIMIT);
+            store.for_each_index_entry(|path_str, basename| {
                 let matched: Vec<(&str, u32)> =
-                    pattern.match_list(std::iter::once(basename.as_str()), &mut matcher);
+                    pattern.match_list(std::iter::once(basename), &mut matcher);
                 if let Some(&(_, score)) = matched.first() {
                     if score > 0 {
-                        let path = PathBuf::from(&path_str);
+                        let path = PathBuf::from(path_str);
                         let mut rank = f64::from(score) * 0.01;
-                        if let Some(ref h) = home {
-                            if let Ok(rel) = path.strip_prefix(h) {
-                                let depth = rel.components().count();
-                                if depth == 1 {
-                                    rank += 10.0;
-                                } else if depth <= 3 {
-                                    #[allow(clippy::cast_precision_loss)]
-                                    {
-                                        rank += 1.0 / depth as f64;
-                                    }
-                                }
-                            }
-                        }
+                        rank += depth_bonus(&path, home.as_ref(), 10.0, 1.0);
                         rank *= boost_for(&path);
-                        results.push(SearchResult {
+                        top.push(SearchResult {
                             path,
                             score: rank,
                             source: ResultSource::Filesystem,
                         });
                     }
                 }
-            }
+            });
+            results.extend(top.into_vec());
         }
     } else {
         let patterns: Vec<Pattern> = keywords
@@ -370,9 +443,11 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
             })
             .collect();
 
+        // 同上:死路徑收集起來一次退場。
+        let mut dead: Vec<PathBuf> = Vec::new();
         for (path, entry) in store.all_history() {
             if !path.exists() {
-                store.retire_missing(&path);
+                dead.push(path);
                 continue;
             }
             let basename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -397,41 +472,34 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 });
             }
         }
+        if !dead.is_empty() {
+            store.retire_missing_batch(&dead);
+        }
 
         if store.has_index() {
-            for (path_str, basename) in store.all_index_entries() {
+            let mut top = TopN::new(FALLBACK_INDEX_LIMIT);
+            store.for_each_index_entry(|path_str, basename| {
                 if let Some((total_score, matched)) =
-                    fuzzy_match_words(keywords, &patterns, &basename, &mut matcher)
+                    fuzzy_match_words(keywords, &patterns, basename, &mut matcher)
                 {
                     // index has ~246k entries vs ~73 in history: surfacing partial
                     // matches here floods the picker (e.g. "open" alone hits 745 dirs),
                     // so require all keywords to match for index results.
                     if matched < keywords.len() {
-                        continue;
+                        return;
                     }
-                    let path = PathBuf::from(&path_str);
+                    let path = PathBuf::from(path_str);
                     let mut rank = f64::from(total_score) * 0.01;
-                    if let Some(ref h) = home {
-                        if let Ok(rel) = path.strip_prefix(h) {
-                            let depth = rel.components().count();
-                            if depth == 1 {
-                                rank += 10.0;
-                            } else if depth <= 3 {
-                                #[allow(clippy::cast_precision_loss)]
-                                {
-                                    rank += 1.0 / depth as f64;
-                                }
-                            }
-                        }
-                    }
+                    rank += depth_bonus(&path, home.as_ref(), 10.0, 1.0);
                     rank *= boost_for(&path);
-                    results.push(SearchResult {
+                    top.push(SearchResult {
                         path,
                         score: rank,
                         source: ResultSource::Filesystem,
                     });
                 }
-            }
+            });
+            results.extend(top.into_vec());
         }
     }
 
@@ -543,9 +611,11 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
     let query_joined = keywords.join("-");
 
+    // 死路徑收集起來,迴圈跑完一次交易退場。
+    let mut dead: Vec<PathBuf> = Vec::new();
     for (path, entry) in store.all_history() {
         if !path.exists() {
-            store.retire_missing(&path);
+            dead.push(path);
             continue;
         }
         let basename = path
@@ -566,37 +636,33 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
             });
         }
     }
+    if !dead.is_empty() {
+        store.retire_missing_batch(&dead);
+    }
 
     if store.has_index() {
-        for (path_str, basename) in store.all_index_entries() {
-            let dist = damerau_levenshtein(&query_joined, &basename);
-            let threshold = edit_distance_threshold(&query_joined);
+        // 串流 + top-N:typo fallback 是「全查不到」時才走的路,更不能為它
+        // 把整個索引搬進記憶體(實測 RSS 81MB / 0.5s)。
+        let threshold = edit_distance_threshold(&query_joined);
+        let mut top = TopN::new(FALLBACK_INDEX_LIMIT);
+        store.for_each_index_entry(|path_str, basename| {
+            let dist = damerau_levenshtein(&query_joined, basename);
             if dist <= threshold {
                 let max_len = query_joined.len().max(basename.len());
+                #[allow(clippy::cast_precision_loss)]
                 let sim = 1.0 - (dist as f64 / max_len as f64);
-                let path = PathBuf::from(&path_str);
+                let path = PathBuf::from(path_str);
                 let mut rank = sim * 10.0;
-                if let Some(ref h) = home {
-                    if let Ok(rel) = path.strip_prefix(h) {
-                        let depth = rel.components().count();
-                        if depth == 1 {
-                            rank += 5.0;
-                        } else if depth <= 3 {
-                            #[allow(clippy::cast_precision_loss)]
-                            {
-                                rank += 1.0 / depth as f64;
-                            }
-                        }
-                    }
-                }
+                rank += depth_bonus(&path, home.as_ref(), 5.0, 1.0);
                 rank *= boost_for(&path);
-                results.push(SearchResult {
+                top.push(SearchResult {
                     path,
                     score: rank,
                     source: ResultSource::Filesystem,
                 });
             }
-        }
+        });
+        results.extend(top.into_vec());
     }
 
     results

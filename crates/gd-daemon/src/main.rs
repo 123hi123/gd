@@ -23,6 +23,10 @@ const FANOTIFY_RETRY_SECS: u64 = 30 * 60;
 /// 也不會退化成高頻掃;5 分鐘內的索引空窗由 shell hook(你走進去就入庫)
 /// 與查詢端 lazy 修正兜底。
 const OVERFLOW_CATCHUP_MIN_SECS: u64 = 5 * 60;
+/// 溢位補掃的強制上限:補掃原本只在「事件流安靜」(poll timeout)時觸發,
+/// 但最需要補掃的事件洪水期間恰恰沒有安靜空檔 → 補掃會被無限延後。
+/// 標記起來超過這個時間就不等安靜了,直接補掃。
+const OVERFLOW_FORCE_CATCHUP_SECS: u64 = 10 * 60;
 /// 停機不足這個秒數就跳過啟動 catchup:`gd update` 那種十幾秒的重啟不值得
 /// 一次全樹走訪(這麼短的空窗內的變更,靠 shell hook 與 lazy 修正即可)。
 const STARTUP_CATCHUP_MIN_DOWNTIME_SECS: u64 = 60;
@@ -136,37 +140,68 @@ fn main() -> Result<()> {
 
     let index = PathIndex::open(&data_dir);
 
+    // 任何一次掃描被終止訊號打斷就設起來,收尾時據此決定時間戳怎麼寫
+    // (見 write_timestamp_incomplete)。掃描現在可中斷了,所以「中斷」
+    // 必須是一個會被記住的狀態,否則索引缺口會被乾淨的時間戳掩蓋。
+    let scan_incomplete = AtomicBool::new(false);
+
     // daemon.fallback=off 只約束「降級狀態」:fanotify 正常時,啟動的
     // bootstrap/catchup 是事件驅動模式的一部分(一次性、有界),照跑。
     let no_scan = fallback_off && fan_fd.is_none();
 
-    if no_scan {
+    // bootstrap 排在 no_scan 之前:daemon.fallback=off 管的是「持續的背景
+    // 掃描」,不是「一次性的初始建索引」— 沒有索引的 gd 根本不能用。
+    if !index.has_data() {
+        eprintln!("gd-daemon: no index, scanning {}...", home.display());
+        let r = scanner::full_scan(&home, &index, &term)?;
+        if r.aborted {
+            scan_incomplete.store(true, Ordering::Relaxed);
+            eprintln!("gd-daemon: scan interrupted by shutdown signal.");
+        } else {
+            eprintln!("gd-daemon: indexed {} dirs.", r.count);
+        }
+    } else if no_scan {
         eprintln!(
-            "gd-daemon: daemon.fallback=off — skipping startup scan ({} dirs indexed).",
+            "gd-daemon: daemon.fallback=off — {} dirs indexed, skipping background scan.",
             index.len()
         );
-    } else if !index.has_data() {
-        eprintln!("gd-daemon: no index, scanning {}...", home.display());
-        let count = scanner::full_scan(&home, &index)?;
-        eprintln!("gd-daemon: indexed {count} dirs.");
     } else if let Some(ts) = read_timestamp(&timestamp_file) {
         // 上次乾淨關閉:補上停機期間新增的目錄 — 但短暫重啟(gd update)
         // 不值得為十幾秒的空窗走訪整棵樹。
-        let downtime = SystemTime::now()
+        let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(ts);
-        if downtime < STARTUP_CATCHUP_MIN_DOWNTIME_SECS {
+            .as_secs();
+        // ts 在未來(時鐘倒退、VM snapshot 還原、RTC 沒電)→ 時間戳不可信,
+        // 算出來的 downtime 會是 0 而錯誤地跳過 catchup,一律照掃。
+        let clock_skew = ts > now;
+        let downtime = now.saturating_sub(ts);
+        if !clock_skew && downtime < STARTUP_CATCHUP_MIN_DOWNTIME_SECS {
             eprintln!("gd-daemon: downtime {downtime}s, skipping catchup.");
         } else {
+            if clock_skew {
+                eprintln!(
+                    "gd-daemon: last-shutdown timestamp is {}s in the future \
+                     (clock went backwards); catching up anyway.",
+                    ts - now
+                );
+            }
             eprintln!("gd-daemon: catching up since last shutdown...");
-            match scanner::catchup_scan(&home, &index) {
-                Ok(added) => eprintln!("gd-daemon: added {added} new dirs."),
+            match scanner::catchup_scan(&home, &index, &term) {
+                Ok(r) if r.aborted => {
+                    scan_incomplete.store(true, Ordering::Relaxed);
+                    eprintln!("gd-daemon: scan interrupted by shutdown signal.")
+                }
+                Ok(r) => eprintln!("gd-daemon: added {} new dirs.", r.count),
                 Err(e) => {
                     eprintln!("gd-daemon: catchup failed ({e}), doing full scan...");
-                    let count = scanner::full_scan(&home, &index)?;
-                    eprintln!("gd-daemon: indexed {count} dirs.");
+                    let r = scanner::full_scan(&home, &index, &term)?;
+                    if r.aborted {
+                        scan_incomplete.store(true, Ordering::Relaxed);
+                        eprintln!("gd-daemon: scan interrupted by shutdown signal.");
+                    } else {
+                        eprintln!("gd-daemon: indexed {} dirs.", r.count);
+                    }
                 }
             }
         }
@@ -181,19 +216,26 @@ fn main() -> Result<()> {
         match fan_fd {
             Some(fd) => {
                 write_mode(&data_dir, "fanotify");
-                event_loop(&term, fd, mount_fd, &home, &index);
+                event_loop(&term, &scan_incomplete, fd, mount_fd, &home, &index);
                 break; // event_loop 只在收到終止訊號時返回
             }
             None => {
                 write_mode(&data_dir, if fallback_off { "off" } else { "poll" });
-                match fallback_loop(&term, &home, &index, fallback_off) {
+                match fallback_loop(&term, &scan_incomplete, &home, &index, fallback_off) {
                     Some(fd) => {
                         // mark 已掛上、事件開始排隊,再補一次 catchup 蓋住
                         // 輪詢空窗期的變更 — 順序不能反,否則有縫。
                         eprintln!("gd-daemon: fanotify recovered, switching to event mode.");
-                        match scanner::catchup_scan(&home, &index) {
-                            Ok(added) if added > 0 => {
-                                eprintln!("gd-daemon: catchup added {added} dirs.")
+                        // 模式先寫:catchup 可能跑數十秒,這期間 gd doctor
+                        // 讀到的必須是「已經是 fanotify」,不能還停在 poll。
+                        write_mode(&data_dir, "fanotify");
+                        match scanner::catchup_scan(&home, &index, &term) {
+                            Ok(r) if r.aborted => {
+                                scan_incomplete.store(true, Ordering::Relaxed);
+                                eprintln!("gd-daemon: scan interrupted by shutdown signal.")
+                            }
+                            Ok(r) if r.count > 0 => {
+                                eprintln!("gd-daemon: catchup added {} dirs.", r.count)
                             }
                             Ok(_) => {}
                             Err(e) => eprintln!("gd-daemon: catchup error: {e}"),
@@ -209,7 +251,11 @@ fn main() -> Result<()> {
     if let Err(e) = index.flush() {
         eprintln!("gd-daemon: final flush error: {e}");
     }
-    write_timestamp(&timestamp_file);
+    if scan_incomplete.load(Ordering::Relaxed) {
+        write_timestamp_incomplete(&timestamp_file);
+    } else {
+        write_timestamp(&timestamp_file);
+    }
     let _ = std::fs::remove_file(&pid_file);
     if let Some(fd) = fan_fd {
         unsafe { libc::close(fd) };
@@ -220,23 +266,36 @@ fn main() -> Result<()> {
 }
 
 /// fanotify 事件迴圈。只在收到終止訊號時返回。
-fn event_loop(term: &AtomicBool, fan_fd: i32, mount_fd: i32, home: &Path, index: &PathIndex) {
+fn event_loop(
+    term: &AtomicBool,
+    scan_incomplete: &AtomicBool,
+    fan_fd: i32,
+    mount_fd: i32,
+    home: &Path,
+    index: &PathIndex,
+) {
     eprintln!("gd-daemon: {} dirs indexed. Watching.", index.len());
 
     let mut last_flush = Instant::now();
     // 佇列溢位 = 有事件被 kernel 丟掉(npm install、rm -rf 大樹這種洪水;
     // 排除清單只擋入庫,擋不住事件送達)。這是事件模式唯一需要 rescan 的
-    // 常態情境:標記起來,等事件流安靜(poll timeout)再補掃,且限流。
+    // 常態情境:標記起來,等事件流安靜(poll timeout)再補掃(限流;
+    // 洪水久久不停就到 OVERFLOW_FORCE_CATCHUP_SECS 硬上)。
     // 漏掉的刪除事件不用管 — 查詢端的 lazy 修正會收拾。
     let mut overflow_pending = false;
+    let mut overflow_since: Option<Instant> = None;
     let mut last_overflow_catchup: Option<Instant> = None;
 
     while !term.load(Ordering::Relaxed) {
+        // 這輪是不是 poll 逾時(= 事件流安靜)。溢位補掃優先挑這種時候跑。
+        let mut idle = false;
+
         match fan::poll_events(fan_fd, 2000) {
             Ok(true) => {
                 let (events, overflow) = fan::read_events(fan_fd, mount_fd);
                 if overflow && !overflow_pending {
                     overflow_pending = true;
+                    overflow_since = Some(Instant::now());
                     eprintln!(
                         "gd-daemon: fanotify queue overflow — events lost, \
                          catchup scheduled after the burst settles."
@@ -254,7 +313,14 @@ fn event_loop(term: &AtomicBool, fan_fd: i32, mount_fd: i32, home: &Path, index:
                         }
                         fan::DirEvent::Deleted(path) => {
                             if path.starts_with(home) {
-                                index.remove(&path);
+                                // 用 remove_subtree 而不是 remove:rmdir 要求目錄
+                                // 是空的,所以索引裡任何殘留的子項都是漏收的
+                                // delete 事件(`rm -rf` 時子項事件要靠父目錄的
+                                // file handle 還原路徑,父目錄先被刪掉就解不開
+                                // → 靜默丟棄)。刪父時順手清子樹把這個洞補起來。
+                                // 成本是 PK index 的一次範圍掃,不是全表掃
+                                // (見 index.rs 的 subtree_bounds)。
+                                index.remove_subtree(&path);
                             }
                         }
                         fan::DirEvent::Renamed(old, new) => {
@@ -267,16 +333,19 @@ fn event_loop(term: &AtomicBool, fan_fd: i32, mount_fd: i32, home: &Path, index:
                                         index.remove_subtree(&old);
                                     } else if index.rename(&old, &new) == 0 {
                                         // Source wasn't indexed (e.g. moved in from an
-                                        // excluded/unwatched location): index the new dir.
-                                        index.add(new);
+                                        // excluded/unwatched location): index the new dir
+                                        // *and* its subtree — rename is atomic, so the
+                                        // kernel sends no CREATE for the children.
+                                        scanner::scan_subtree(&new, index);
                                     }
                                 }
                                 // 搬出家目錄 = 對索引而言整棵消失。
                                 (true, false) => index.remove_subtree(&old),
-                                // 搬進家目錄 = 新目錄。
+                                // 搬進家目錄 = 新目錄(連同整棵子樹,
+                                // 原子 rename 不會補送子目錄的 CREATE)。
                                 (false, true) => {
                                     if !is_excluded(&new) {
-                                        index.add(new);
+                                        scanner::scan_subtree(&new, index);
                                     }
                                 }
                                 (false, false) => {}
@@ -297,24 +366,35 @@ fn event_loop(term: &AtomicBool, fan_fd: i32, mount_fd: i32, home: &Path, index:
                     eprintln!("gd-daemon: flush error: {e}");
                 }
                 last_flush = Instant::now();
-
-                // 事件流安靜下來了,補上溢位期間漏掉的新目錄。
-                if overflow_pending
-                    && last_overflow_catchup
-                        .map_or(true, |t| t.elapsed().as_secs() >= OVERFLOW_CATCHUP_MIN_SECS)
-                {
-                    match scanner::catchup_scan(home, index) {
-                        Ok(added) => {
-                            eprintln!("gd-daemon: overflow catchup done, {added} dirs added.");
-                        }
-                        Err(e) => eprintln!("gd-daemon: overflow catchup error: {e}"),
-                    }
-                    overflow_pending = false;
-                    last_overflow_catchup = Some(Instant::now());
-                    unsafe { libc::malloc_trim(0) };
-                }
+                idle = true;
             }
             Err(_) => {}
+        }
+
+        // 補溢位期間漏掉的新目錄。優先等事件流安靜(idle)再跑,但洪水
+        // 可能一直不給空檔 — 標記超過 OVERFLOW_FORCE_CATCHUP_SECS 就硬上,
+        // 否則補掃會被無限延後。兩次補掃之間仍受最小間隔節流。
+        let forced = overflow_since
+            .map_or(false, |t| t.elapsed().as_secs() >= OVERFLOW_FORCE_CATCHUP_SECS);
+        if overflow_pending
+            && (idle || forced)
+            && last_overflow_catchup
+                .map_or(true, |t| t.elapsed().as_secs() >= OVERFLOW_CATCHUP_MIN_SECS)
+        {
+            match scanner::catchup_scan(home, index, term) {
+                Ok(r) if r.aborted => {
+                    scan_incomplete.store(true, Ordering::Relaxed);
+                    eprintln!("gd-daemon: scan interrupted by shutdown signal.")
+                }
+                Ok(r) => {
+                    eprintln!("gd-daemon: overflow catchup done, {} dirs added.", r.count);
+                }
+                Err(e) => eprintln!("gd-daemon: overflow catchup error: {e}"),
+            }
+            overflow_pending = false;
+            overflow_since = None;
+            last_overflow_catchup = Some(Instant::now());
+            unsafe { libc::malloc_trim(0) };
         }
     }
 }
@@ -328,7 +408,13 @@ fn write_mode(data_dir: &Path, mode: &str) {
 /// 每 CATCHUP_INTERVAL_SECS 一次 catchup 發現新目錄。沒有定期 full
 /// rescan — 死路徑由查詢端 lazy 退場(retire_missing),徹底清掃交給
 /// 手動 `gd clean`。回傳 Some(fd) = fanotify 重試成功;None = 收到終止訊號。
-fn fallback_loop(term: &AtomicBool, home: &Path, index: &PathIndex, off: bool) -> Option<i32> {
+fn fallback_loop(
+    term: &AtomicBool,
+    scan_incomplete: &AtomicBool,
+    home: &Path,
+    index: &PathIndex,
+    off: bool,
+) -> Option<i32> {
     if off {
         eprintln!(
             "gd-daemon: {} dirs indexed. Fallback 'off': no background scanning; \
@@ -364,9 +450,13 @@ fn fallback_loop(term: &AtomicBool, home: &Path, index: &PathIndex, off: bool) -
         }
 
         if last_catchup.elapsed().as_secs() >= CATCHUP_INTERVAL_SECS {
-            match scanner::catchup_scan(home, index) {
-                Ok(added) if added > 0 => {
-                    eprintln!("gd-daemon: catchup added {added} dirs.");
+            match scanner::catchup_scan(home, index, term) {
+                Ok(r) if r.aborted => {
+                    scan_incomplete.store(true, Ordering::Relaxed);
+                    eprintln!("gd-daemon: scan interrupted by shutdown signal.")
+                }
+                Ok(r) if r.count > 0 => {
+                    eprintln!("gd-daemon: catchup added {} dirs.", r.count);
                     if let Err(e) = index.flush() {
                         eprintln!("gd-daemon: flush error: {e}");
                     }
@@ -395,4 +485,15 @@ fn write_timestamp(path: &std::path::Path) {
         .unwrap_or_default()
         .as_secs();
     let _ = std::fs::write(path, now.to_string());
+}
+
+/// 掃描被終止訊號打斷時的收尾:時間戳寫 0,而不是「現在」。
+///
+/// 時間戳的語意是「索引在這個時刻是完整的」。掃描中途被打斷代表索引有
+/// 缺口,此時若照常寫下現在時間,下次啟動算出的 downtime 會很小 →
+/// 跳過 catchup(fanotify 模式又沒有任何定期補掃)→ 缺口永遠補不回來。
+/// 寫 0 讓下次啟動必定 downtime 超標而跑一次 catchup。
+/// 不能改成「刪掉時間戳檔」— 那會落進 `index exists` 分支,反而完全不掃。
+fn write_timestamp_incomplete(path: &std::path::Path) {
+    let _ = std::fs::write(path, "0");
 }

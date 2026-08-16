@@ -95,19 +95,35 @@ impl KeyStore {
     /// 暫時不在,徹底清除是手動 `gd clean` 的職責。這讓死路徑第一次被查到
     /// 就退場,索引不再依賴任何定期全掃來清屍體。
     pub fn retire_missing(&self, path: &Path) {
-        let s = path.to_string_lossy();
-        self.conn
-            .execute(
+        self.retire_missing_batch(std::slice::from_ref(&path.to_path_buf()));
+    }
+
+    /// 一次交易退場一整批死路徑。查詢路徑上一次可能撞到數千筆死列,
+    /// 逐筆各自成交易的話會發出上千次 fsync,並且每筆都可能撞上 daemon
+    /// 掃描的寫鎖各吃一次 `busy_timeout`。
+    pub fn retire_missing_batch(&self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        // 一個 IMMEDIATE 交易包住整批:只 fsync 一次、只搶一次寫鎖。
+        let began = self.conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+        for path in paths {
+            let s = path.to_string_lossy();
+            if let Ok(mut stmt) = self.conn.prepare_cached(
                 "DELETE FROM dirs WHERE path = ?1 AND visits = 0 AND selections = 0",
-                params![s.as_ref()],
-            )
-            .ok();
-        self.conn
-            .execute(
-                "UPDATE dirs SET in_index = 0 WHERE path = ?1",
-                params![s.as_ref()],
-            )
-            .ok();
+            ) {
+                stmt.execute(params![s.as_ref()]).ok();
+            }
+            if let Ok(mut stmt) = self
+                .conn
+                .prepare_cached("UPDATE dirs SET in_index = 0 WHERE path = ?1")
+            {
+                stmt.execute(params![s.as_ref()]).ok();
+            }
+        }
+        if began {
+            self.conn.execute_batch("COMMIT").ok();
+        }
     }
 
     // --- Settings ---
@@ -203,12 +219,12 @@ impl KeyStore {
 
     pub fn record_visit(&mut self, path: &Path) {
         let now = frecency::now_secs();
+        // 已知限制:非 UTF-8 路徑在這裡仍走 to_string_lossy,無效位元組會被
+        // 換成 U+FFFD。歷史是使用者真的走過的目錄,像 index.rs 那樣直接跳過
+        // 會讓 gd 對這些目錄完全失憶,比留一筆近似鍵更糟,故維持現行行為。
         let path_str = path.to_string_lossy();
-        let basename_lower = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let path_str = trim_trailing_slash(&path_str);
+        let basename_lower = basename_lower_of(path_str);
         self.conn
             .execute(
                 "INSERT INTO dirs (path, basename_lower, visits, selections, last_access)
@@ -217,19 +233,17 @@ impl KeyStore {
                    visits = visits + 1,
                    last_access = excluded.last_access,
                    basename_lower = excluded.basename_lower",
-                params![path_str.as_ref(), basename_lower, now],
+                params![path_str, basename_lower, now],
             )
             .ok();
     }
 
     pub fn record_selection(&mut self, path: &Path) {
         let now = frecency::now_secs();
+        // 同 record_visit:非 UTF-8 路徑維持 lossy,不跳過。
         let path_str = path.to_string_lossy();
-        let basename_lower = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let path_str = trim_trailing_slash(&path_str);
+        let basename_lower = basename_lower_of(path_str);
         self.conn
             .execute(
                 "INSERT INTO dirs (path, basename_lower, visits, selections, last_access)
@@ -238,7 +252,7 @@ impl KeyStore {
                    selections = selections + 1,
                    last_access = excluded.last_access,
                    basename_lower = excluded.basename_lower",
-                params![path_str.as_ref(), basename_lower, now],
+                params![path_str, basename_lower, now],
             )
             .ok();
     }
@@ -424,47 +438,122 @@ impl KeyStore {
         .collect()
     }
 
+    /// 串流迭代索引列,不把 36.8 萬列一次具現成 Vec。
+    /// callback 收到 (path, `basename_lower`) 的借用,想留就自己複製。
+    pub fn for_each_index_entry<F: FnMut(&str, &str)>(&self, mut f: F) {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT path, basename_lower FROM dirs WHERE in_index = 1")
+        else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return;
+        };
+        for row in rows.flatten() {
+            f(&row.0, &row.1);
+        }
+    }
+
     // --- Clean ---
 
-    pub fn clean(&mut self) -> (Vec<(String, PathBuf)>, Vec<PathBuf>) {
-        let mut removed_links = Vec::new();
-        let mut removed_history = Vec::new();
+    /// 徹底清掃死路徑:links、有歷史的列、以及**純索引列**全部 stat 一次。
+    ///
+    /// 舊版只掃 links + `all_history()` (全庫幾百列),36 萬筆純索引列一列都沒碰,
+    /// 於是明明近三成索引是死的,gd clean 卻回報「nothing to clean」。
+    /// 舊版還會對死的歷史列先 `UPDATE ... visits = 0, selections = 0` 再
+    /// `DELETE ... AND in_index = 0`:碰到 `in_index = 1` 的死列就變成歷史被洗掉、
+    /// 列卻刪不掉,從此 `all_history()` 再也撈不到它 —— 永久不可回收。現在一律
+    /// 無條件 DELETE,不再有洗白那一步。
+    ///
+    /// 判定死活只靠 stat,不看 `in_index` (它的語意是「daemon 的索引目前
+    /// 包含這條路徑」,不是「路徑還活著」)。
+    pub fn clean(&mut self) -> CleanReport {
+        let mut report = CleanReport {
+            removed_links: Vec::new(),
+            removed_history: Vec::new(),
+            removed_index: 0,
+            scanned: 0,
+        };
 
         let links = self.list_links();
         for (alias, path) in &links {
             if !path.exists() {
-                removed_links.push((alias.clone(), path.clone()));
+                report.removed_links.push((alias.clone(), path.clone()));
             }
         }
-        for (alias, _) in &removed_links {
+        for (alias, _) in &report.removed_links {
             self.conn
                 .execute("DELETE FROM links WHERE alias = ?1", params![alias])
                 .ok();
         }
 
-        let history = self.all_history();
-        for (path, _) in &history {
-            if !path.exists() {
-                removed_history.push(path.clone());
+        let total: usize = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM dirs", [], |row| row.get(0))
+            .unwrap_or(0);
+
+        // 第一階段:streaming 掃全表 stat,只把「死的」收進記憶體。
+        // (36.8 萬列一次具現成 Vec 會吃掉幾十 MB;死列通常遠少於總數。)
+        // stmt 借用了 self.conn,得在開 transaction 前 drop,所以整段包成 block。
+        let mut dead: Vec<(String, bool)> = Vec::new();
+        {
+            let Ok(mut stmt) = self
+                .conn
+                .prepare("SELECT path, visits, selections FROM dirs")
+            else {
+                return report;
+            };
+            let Ok(rows) = stmt.query_map([], |row| {
+                let path: String = row.get(0)?;
+                let visits: u64 = row.get(1)?;
+                let selections: u64 = row.get(2)?;
+                Ok((path, visits > 0 || selections > 0))
+            }) else {
+                return report;
+            };
+            for (path, has_history) in rows.flatten() {
+                report.scanned += 1;
+                if report.scanned % 5000 == 0 {
+                    // 36.8 萬次 stat 會跑好一陣子,沒進度使用者會以為當掉了。
+                    eprint!("\rgd clean: scanned {}/{total}...", report.scanned);
+                }
+                if !Path::new(&path).exists() {
+                    dead.push((path, has_history));
+                }
             }
         }
-        for path in &removed_history {
-            let s = path.to_string_lossy();
-            self.conn
-                .execute(
-                    "UPDATE dirs SET visits = 0, selections = 0, last_access = 0 WHERE path = ?1",
-                    params![s.as_ref()],
-                )
-                .ok();
-            self.conn
-                .execute(
-                    "DELETE FROM dirs WHERE path = ?1 AND in_index = 0",
-                    params![s.as_ref()],
-                )
-                .ok();
+        if report.scanned >= 5000 {
+            // 尾端補空白蓋掉上一行進度殘留的 "..",最後務必換行。
+            eprintln!("\rgd clean: scanned {}/{total}.  ", report.scanned);
         }
 
-        (removed_links, removed_history)
+        // 第二階段:一個 transaction 刪完整批。
+        if !dead.is_empty() {
+            let began = self.conn.execute_batch("BEGIN IMMEDIATE").is_ok();
+            for (path, has_history) in &dead {
+                let deleted = self
+                    .conn
+                    .prepare_cached("DELETE FROM dirs WHERE path = ?1")
+                    .and_then(|mut stmt| stmt.execute(params![path]))
+                    .unwrap_or(0);
+                if deleted == 0 {
+                    continue;
+                }
+                if *has_history {
+                    report.removed_history.push(PathBuf::from(path));
+                } else {
+                    report.removed_index += 1;
+                }
+            }
+            if began {
+                self.conn.execute_batch("COMMIT").ok();
+            }
+        }
+
+        report
     }
 
     pub fn export_json(&self) -> Result<String, Error> {
@@ -530,6 +619,19 @@ impl KeyStore {
 
 // --- Public types ---
 
+/// `gd clean` 的成果報告。
+#[derive(Debug, Clone, Default)]
+pub struct CleanReport {
+    /// 指向不存在路徑、已刪除的 link
+    pub removed_links: Vec<(String, PathBuf)>,
+    /// 有歷史(visits/selections > 0)且路徑已不存在、已刪除的列
+    pub removed_history: Vec<PathBuf>,
+    /// 純索引列(無歷史)且路徑已不存在、已刪除的筆數
+    pub removed_index: usize,
+    /// 實際 stat 過的列數(讓 CLI 能說「掃了 N 筆」)
+    pub scanned: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct HistoryEntry {
     pub visits: u64,
@@ -581,6 +683,29 @@ pub fn match_quality_tiebreak(basename_lower: &str, query_lower: &str) -> f64 {
 }
 
 // --- Internal helpers ---
+
+/// 去掉尾端斜線。DB 實測有 `/home/joe/文件/tools/gcpcontrol` 和同名帶斜線的
+/// 版本並存,同一個目錄的 selections 被拆成 101 + 11 兩份。
+///
+/// 刻意不用 `crate::path::normalize` — 那是 canonicalize:會解 symlink、
+/// 也會對不存在的路徑直接失敗,語意改動太大。這裡只要純字串正規化。
+fn trim_trailing_slash(s: &str) -> &str {
+    let trimmed = s.trim_end_matches('/');
+    // 根目錄 "/" 不能被砍成空字串。
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+fn basename_lower_of(path_str: &str) -> String {
+    Path::new(path_str)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
 
 fn default_data_dir() -> PathBuf {
     dirs::data_dir()
