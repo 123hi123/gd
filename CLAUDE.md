@@ -40,11 +40,6 @@ systemctl --user start gd-daemon
 ## Constraints
 
 - Daemon RAM: ~15MB (SQLite-backed, no in-memory index)
-- Query latency (measured, 268k-row index): ~40 ms when the query hits, ~110 ms
-  through the typo fallback, ~300 ms when nothing matches at all. The fallbacks
-  scan every indexed basename in Rust, so their cost is linear in index size —
-  keep the index free of dead rows (`gd clean`) and it stays in this range.
-  The old "<25 ms" figure in this file was a target, never a measurement.
 - Search matches **basename only**, not full path
 - `in_index` means exactly one thing: **the daemon's index currently contains
   this path**. It is NOT a "this path is dead" flag — a row the shell hook just

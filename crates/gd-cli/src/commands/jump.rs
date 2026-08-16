@@ -311,14 +311,33 @@ fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 /// 衝到 80MB、耗時 0.25s,全查不到更是 0.5s)。
 const FALLBACK_INDEX_LIMIT: usize = 200;
 
+/// 第二階段取回 path 的方式切換點:候選數 ≤ 這個值就逐筆 rowid 主鍵探測,
+/// 超過就改成循序掃一次索引列。
+///
+/// 兩條路的結果完全一樣,只是成本曲線不同:主鍵探測是 O(候選數 × log n) 的
+/// 隨機 I/O,循序掃是固定成本(實測全撈 path 88 ms)。候選少時探測遠比全掃
+/// 便宜;候選多到上萬筆時,隨機探測會反過來比循序掃貴。
+///
+/// **第一階段絕對不能只留前 N 名候選**(曾經這樣寫過,是錯的):最終分數是
+/// `(basename 分數 + depth_bonus) * boost`,而 basename 分數的值域只有 0~2,
+/// `depth_bonus` 卻是 +10、boost 是 ×5 —— 也就是說最終排序幾乎由 depth/boost
+/// 決定,跟 basename 分數近乎無關。實測查 "cnfig" 時真正的第一名 `~/.config`
+/// (basename 分數 1.05,連前 800 名都排不進,卻因為 depth +10 而總分 11.05)
+/// 會被砍掉。所以第一階段留下全部命中,只是它們是 (f64, i64) 而不是路徑字串:
+/// 26.7 萬筆全中也才 4 MB,而且實務上命中數是幾百到幾千。
+const CANDIDATE_PROBE_LIMIT: usize = 20_000;
+
 /// 串流版的「只留分數最高的 N 筆」。超過 2N 就排一次序砍回 N,攤提下來是
 /// O(n) 且記憶體固定,不需要把整個索引具現化。
-struct TopN {
-    items: Vec<SearchResult>,
+///
+/// 分數與 payload 拆開存,是為了兩段式:排序鍵在第二階段才算得出來,而
+/// payload 只是 `PathBuf`,不必為了排序先組出完整的 `SearchResult`。
+struct TopN<T> {
+    items: Vec<(f64, T)>,
     limit: usize,
 }
 
-impl TopN {
+impl<T> TopN<T> {
     fn new(limit: usize) -> Self {
         Self {
             items: Vec::with_capacity(limit * 2),
@@ -326,8 +345,8 @@ impl TopN {
         }
     }
 
-    fn push(&mut self, r: SearchResult) {
-        self.items.push(r);
+    fn push(&mut self, score: f64, item: T) {
+        self.items.push((score, item));
         if self.items.len() >= self.limit * 2 {
             self.trim();
         }
@@ -335,14 +354,91 @@ impl TopN {
 
     fn trim(&mut self) {
         self.items
-            .sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+            .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         self.items.truncate(self.limit);
     }
 
-    fn into_vec(mut self) -> Vec<SearchResult> {
+    fn into_vec(mut self) -> Vec<(f64, T)> {
         self.trim();
         self.items
     }
+}
+
+/// fallback 的第二階段:把第一階段命中的 `(basename 分數, rowid)` 候選取回
+/// path,補上 `depth_bonus` 與 boost 算出最終分數,再用 `TopN` 收斂到
+/// `FALLBACK_INDEX_LIMIT` 名。
+///
+/// 第一階段的分數就是最終分數裡「只跟 basename 有關」的那一項(fuzzy 是
+/// `nucleo * 0.01`,typo 是 `sim * 10.0`),這裡直接加 depth、乘 boost,算式
+/// 與舊版逐列就地計算時逐位元相同;候選也沒有先砍過 —— 所以**留下來的 200 筆
+/// 分數多重集與舊版完全相同**(對真實 DB 的 14 組查詢逐一比對過)。
+///
+/// 同分時留下哪幾筆也與舊版一致 —— 前提是推進 `TopN` 的順序要是 rowid 順序
+/// (即舊版掃主表的順序),所以下面探測前會先把 rowid 排序,別把那行拿掉:
+/// 第一階段是走索引掃的,順序是 (`basename_lower`, rowid),照那個順序推進去
+/// 會換一批同分者留下來(實測 200 筆裡有 108~200 筆重疊,分數分佈相同)。
+///
+/// 唯一的行為差異:第一、二階段之間若有列被 daemon 刪掉,那一筆會靜默消失
+/// (舊版單趟掃描沒有這個空窗)。那種列本來就是死的,無所謂。
+fn resolve_candidates(
+    store: &KeyStore,
+    candidates: Vec<(f64, i64)>,
+    home: Option<&PathBuf>,
+    depth_top: f64,
+    depth_ratio: f64,
+    boost_for: &impl Fn(&Path) -> f64,
+) -> Vec<SearchResult> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut top: TopN<PathBuf> = TopN::new(FALLBACK_INDEX_LIMIT);
+    let score_of = |path: &Path, base: f64| -> f64 {
+        (base + depth_bonus(path, home, depth_top, depth_ratio)) * boost_for(path)
+    };
+
+    if candidates.len() <= CANDIDATE_PROBE_LIMIT {
+        // 候選少:逐筆 rowid 主鍵探測,完全不必再碰全表。
+        let mut base: std::collections::HashMap<i64, f64> =
+            std::collections::HashMap::with_capacity(candidates.len());
+        let mut rowids: Vec<i64> = Vec::with_capacity(candidates.len());
+        for (score, rowid) in candidates {
+            base.insert(rowid, score);
+            rowids.push(rowid);
+        }
+        // 依 rowid 排序後再探測,有兩個作用:(a) 探測順序沿著 B-tree 往前走,
+        // 不是亂跳;(b) 更重要 —— 推進 `TopN` 的順序因此等同「掃主表」的順序,
+        // 同分時留下的那幾筆就與舊版(以及下面的循序分支)完全一致。
+        // 第一階段是走索引掃的,順序是 (basename_lower, rowid),沒有這行排序,
+        // 同分的候選會換一批人留下來。
+        rowids.sort_unstable();
+        for (rowid, path) in store.paths_by_rowid(&rowids) {
+            if let Some(&b) = base.get(&rowid) {
+                let rank = score_of(&path, b);
+                top.push(rank, path);
+            }
+        }
+    } else {
+        // 候選多到上萬筆:改成循序掃一次(成本等同舊版),用 rowid 對照。
+        let base: std::collections::HashMap<i64, f64> =
+            candidates.into_iter().map(|(s, id)| (id, s)).collect();
+        store.for_each_index_path(|rowid, path_str| {
+            if let Some(&b) = base.get(&rowid) {
+                let path = PathBuf::from(path_str);
+                let rank = score_of(&path, b);
+                top.push(rank, path);
+            }
+        });
+    }
+
+    top.into_vec()
+        .into_iter()
+        .map(|(score, path)| SearchResult {
+            path,
+            score,
+            source: ResultSource::Filesystem,
+        })
+        .collect()
 }
 
 /// 索引列的深度加分(離家目錄越淺越可能是使用者要的)。fuzzy / typo 兩個
@@ -414,26 +510,30 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
         }
 
         if store.has_index() {
-            // 串流掃索引,只留 top-N:不要為了 fallback 把 37 萬列搬進記憶體。
-            let mut top = TopN::new(FALLBACK_INDEX_LIMIT);
-            store.for_each_index_entry(|path_str, basename| {
+            // 兩階段之間必須是同一個快照:rowid 會被 SQLite 回收,daemon 又
+            // 隨時在 delete + insert(細節見 KeyStore::read_snapshot)。
+            let _snap = store.read_snapshot();
+            // 第一階段:串流掃索引的 basename(covering index,不碰 38 MB 的
+            // 主表),命中的只記 (分數, rowid) —— 16 bytes,不建 PathBuf。
+            let mut candidates: Vec<(f64, i64)> = Vec::new();
+            store.for_each_index_basename(|rowid, basename| {
                 let matched: Vec<(&str, u32)> =
                     pattern.match_list(std::iter::once(basename), &mut matcher);
                 if let Some(&(_, score)) = matched.first() {
                     if score > 0 {
-                        let path = PathBuf::from(path_str);
-                        let mut rank = f64::from(score) * 0.01;
-                        rank += depth_bonus(&path, home.as_ref(), 10.0, 1.0);
-                        rank *= boost_for(&path);
-                        top.push(SearchResult {
-                            path,
-                            score: rank,
-                            source: ResultSource::Filesystem,
-                        });
+                        candidates.push((f64::from(score) * 0.01, rowid));
                     }
                 }
             });
-            results.extend(top.into_vec());
+            // 第二階段:取回候選的 path,補 depth/boost,收斂到前 N 名。
+            results.extend(resolve_candidates(
+                store,
+                candidates,
+                home.as_ref(),
+                10.0,
+                1.0,
+                &boost_for,
+            ));
         }
     } else {
         let patterns: Vec<Pattern> = keywords
@@ -477,8 +577,11 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
         }
 
         if store.has_index() {
-            let mut top = TopN::new(FALLBACK_INDEX_LIMIT);
-            store.for_each_index_entry(|path_str, basename| {
+            // 同上,兩階段共用一個快照(見 KeyStore::read_snapshot)。
+            let _snap = store.read_snapshot();
+            // 同上,兩段式:先只看 basename 收候選,再取 path 算完整分數。
+            let mut candidates: Vec<(f64, i64)> = Vec::new();
+            store.for_each_index_basename(|rowid, basename| {
                 if let Some((total_score, matched)) =
                     fuzzy_match_words(keywords, &patterns, basename, &mut matcher)
                 {
@@ -488,18 +591,17 @@ fn fuzzy_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                     if matched < keywords.len() {
                         return;
                     }
-                    let path = PathBuf::from(path_str);
-                    let mut rank = f64::from(total_score) * 0.01;
-                    rank += depth_bonus(&path, home.as_ref(), 10.0, 1.0);
-                    rank *= boost_for(&path);
-                    top.push(SearchResult {
-                        path,
-                        score: rank,
-                        source: ResultSource::Filesystem,
-                    });
+                    candidates.push((f64::from(total_score) * 0.01, rowid));
                 }
             });
-            results.extend(top.into_vec());
+            results.extend(resolve_candidates(
+                store,
+                candidates,
+                home.as_ref(),
+                10.0,
+                1.0,
+                &boost_for,
+            ));
         }
     }
 
@@ -559,6 +661,19 @@ fn edit_distance_threshold(keyword: &str) -> usize {
     }
 }
 
+/// `damerau_levenshtein` 的長度定義 —— 預篩必須跟 DP 用同一把尺,否則會誤篩。
+///
+/// 那個函式是先 `to_lowercase()` 再對 **char** 序列做 DP(不是位元組),所以
+/// 這裡回傳的是「小寫化之後的字元數」。直接 `s.chars().count()` 不夠精確:
+/// 少數字元小寫化會變長(例如 'İ' U+0130 → "i̇" 兩個 char),用原字串的字元數
+/// 會低估長度,理論上可能把一個真的在門檻內的候選誤擋掉。
+///
+/// 不配置字串,逐字元累加小寫化後的長度。(`str::to_lowercase` 與逐字元版
+/// 唯一的差異是希臘 sigma 的收尾特例,而那是 1→1,不影響長度。)
+fn lowercase_char_len(s: &str) -> usize {
+    s.chars().map(|c| c.to_lowercase().count()).sum()
+}
+
 fn damerau_levenshtein(a: &str, b: &str) -> usize {
     let a: Vec<char> = a.to_lowercase().chars().collect();
     let b: Vec<char> = b.to_lowercase().chars().collect();
@@ -610,6 +725,9 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
     };
 
     let query_joined = keywords.join("-");
+    // 迴圈不變量,提到外面算一次(值與舊版逐圈重算完全相同)。
+    let threshold = edit_distance_threshold(&query_joined);
+    let query_len = lowercase_char_len(&query_joined);
 
     // 死路徑收集起來,迴圈跑完一次交易退場。
     let mut dead: Vec<PathBuf> = Vec::new();
@@ -622,8 +740,12 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
+        // 長度預篩:編輯距離 ≤ threshold 的必要條件是長度差 ≤ threshold,
+        // 擋掉的候選連 O(mn) 的 DP 都不用進。詳見 lowercase_char_len。
+        if lowercase_char_len(basename).abs_diff(query_len) > threshold {
+            continue;
+        }
         let dist = damerau_levenshtein(&query_joined, basename);
-        let threshold = edit_distance_threshold(&query_joined);
         if dist <= threshold {
             let max_len = query_joined.len().max(basename.len());
             let sim = 1.0 - (dist as f64 / max_len as f64);
@@ -641,28 +763,33 @@ fn typo_fallback(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
     }
 
     if store.has_index() {
-        // 串流 + top-N:typo fallback 是「全查不到」時才走的路,更不能為它
-        // 把整個索引搬進記憶體(實測 RSS 81MB / 0.5s)。
-        let threshold = edit_distance_threshold(&query_joined);
-        let mut top = TopN::new(FALLBACK_INDEX_LIMIT);
-        store.for_each_index_entry(|path_str, basename| {
+        // 兩階段共用一個快照(見 KeyStore::read_snapshot)。
+        let _snap = store.read_snapshot();
+        // 串流 + top-N + 兩段式:typo fallback 是「全查不到」時才走的路,更不能
+        // 為它把整個索引的 path 搬進記憶體(實測 RSS 81MB / 0.5s)。
+        let mut candidates: Vec<(f64, i64)> = Vec::new();
+        store.for_each_index_basename(|rowid, basename| {
+            // 同 history 迴圈的長度預篩:26.7 萬個 basename 每個都跑一次
+            // O(mn) DP 是這條路徑最大的單一開銷,絕大多數連進 DP 都不必。
+            if lowercase_char_len(basename).abs_diff(query_len) > threshold {
+                return;
+            }
             let dist = damerau_levenshtein(&query_joined, basename);
             if dist <= threshold {
                 let max_len = query_joined.len().max(basename.len());
                 #[allow(clippy::cast_precision_loss)]
                 let sim = 1.0 - (dist as f64 / max_len as f64);
-                let path = PathBuf::from(path_str);
-                let mut rank = sim * 10.0;
-                rank += depth_bonus(&path, home.as_ref(), 5.0, 1.0);
-                rank *= boost_for(&path);
-                top.push(SearchResult {
-                    path,
-                    score: rank,
-                    source: ResultSource::Filesystem,
-                });
+                candidates.push((sim * 10.0, rowid));
             }
         });
-        results.extend(top.into_vec());
+        results.extend(resolve_candidates(
+            store,
+            candidates,
+            home.as_ref(),
+            5.0,
+            1.0,
+            &boost_for,
+        ));
     }
 
     results

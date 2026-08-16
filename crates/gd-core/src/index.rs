@@ -28,6 +28,31 @@ impl PathIndex {
             );",
         )
         .expect("failed to create dirs table");
+        // 查詢索引:CLI 端 `db.rs::create_query_indexes` 有一模一樣的兩行
+        // (兩邊開的是同一個 gd.db,誰先開誰建,IF NOT EXISTS 讓它冪等)。
+        // 改這裡請同步改那裡,說明與量測數字寫在 db.rs 那一份。
+        //
+        // 摘要:idx_dirs_history 是部分索引,只涵蓋有歷史的少數列(全庫 26.7 萬
+        // 列中約 283 列,24 KB),讓歷史查詢不必全表掃;idx_dirs_basename 讓
+        // 「只看 basename 的過濾階段」掃 6.5 MB 的索引而不是 38 MB 的主表。
+        // 欄位順序與欄位清單都不要動 —— SQLite 只有在查詢引用的欄位全在索引裡
+        // 時才會 covering,少一欄就靜默退回全表掃。
+        //
+        // 刻意放在這裡(open 時)而不是任何 bulk transaction 裡:建索引要寫鎖。
+        //
+        // 建不起來不算致命:索引只影響查詢速度,不影響 daemon 的任何職責。
+        // 第一次建立是真寫入(6.5 MB、實測 152 ms 的寫鎖),撞上另一個寫者
+        // 超過 busy_timeout 就會失敗 —— 那也只是下次開的時候再建,絕不該
+        // 讓 daemon panic 而進入 systemd 的重啟迴圈。
+        if let Err(e) = conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_dirs_history
+                ON dirs(basename_lower, path, visits, selections, last_access)
+                WHERE visits > 0 OR selections > 0;
+             CREATE INDEX IF NOT EXISTS idx_dirs_basename
+                ON dirs(basename_lower, in_index);",
+        ) {
+            eprintln!("gd-daemon: could not create query indexes ({e}); will retry on next start");
+        }
         Self { conn }
     }
 

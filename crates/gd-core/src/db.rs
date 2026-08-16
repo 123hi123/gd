@@ -257,6 +257,15 @@ impl KeyStore {
             .ok();
     }
 
+    /// **不要改下面那條 SQL 的 SELECT 欄位清單。**
+    ///
+    /// `path, basename_lower, visits, selections, last_access` + `WHERE
+    /// basename_lower LIKE ? AND (visits > 0 OR selections > 0)` 恰好被部分索引
+    /// `idx_dirs_history` 完全覆蓋(見 `create_query_indexes`),EXPLAIN 是
+    /// `SCAN dirs USING COVERING INDEX idx_dirs_history`:只掃那 283 筆有歷史的
+    /// 列,不碰 26.7 萬列的主表(實測 22.6 ms → 1.8 ms)。
+    /// 多 SELECT 任何一個不在索引裡的欄位(例如 `in_index`)就會退回全表掃 —
+    /// 靜默地慢 12 倍,沒有任何測試會發現。
     pub fn search_history(&self, query: &str) -> Vec<SearchResult> {
         let query_lower = query.to_lowercase();
         let now = frecency::now_secs();
@@ -311,6 +320,8 @@ impl KeyStore {
         results
     }
 
+    /// 同 `search_history`:**SELECT 的欄位清單不要動**,它靠
+    /// `idx_dirs_history` 覆蓋才不必掃主表。
     pub fn search_history_multi(&self, keywords: &[&str]) -> Vec<SearchResult> {
         let now = frecency::now_secs();
         let ordered = keywords
@@ -370,6 +381,7 @@ impl KeyStore {
         results
     }
 
+    /// 多關鍵字版的 `search_index`。兩段式的理由與 `search_index` 相同,見那裡。
     pub fn search_index_multi(&self, keywords: &[&str]) -> Vec<PathBuf> {
         let ordered = keywords
             .iter()
@@ -381,8 +393,9 @@ impl KeyStore {
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT path FROM dirs
-                 WHERE in_index = 1 AND basename_lower LIKE ?1",
+                "SELECT path FROM dirs WHERE rowid IN
+                   (SELECT rowid FROM dirs
+                     WHERE in_index = 1 AND basename_lower LIKE ?1)",
             )
             .unwrap();
         stmt.query_map(params![pattern], |row| {
@@ -406,14 +419,23 @@ impl KeyStore {
             .unwrap_or(false)
     }
 
+    /// 兩段式:內層子查詢**只碰 `basename_lower` / `in_index` / rowid**,
+    /// 因此整個過濾階段走 `idx_dirs_basename` 的 covering scan(6.5 MB);
+    /// 外層才用 rowid 去主表把通過過濾的少數列的 `path` 取回來。
+    ///
+    /// 不要「簡化」成 `SELECT path FROM dirs WHERE in_index = 1 AND
+    /// basename_lower LIKE ?1` —— 那樣 SELECT 引用了 `path`,索引就不再
+    /// covering,SQLite 會退回掃 38 MB 的主表(實測 25 ms vs 16.8 ms,
+    /// 而且加不加索引都一樣慢)。回傳值語意完全相同,差別只在執行計畫。
     pub fn search_index(&self, query: &str) -> Vec<PathBuf> {
         let query_lower = query.to_lowercase();
         let pattern = format!("%{query_lower}%");
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT path FROM dirs
-                 WHERE in_index = 1 AND basename_lower LIKE ?1",
+                "SELECT path FROM dirs WHERE rowid IN
+                   (SELECT rowid FROM dirs
+                     WHERE in_index = 1 AND basename_lower LIKE ?1)",
             )
             .unwrap();
         stmt.query_map(params![pattern], |row| {
@@ -438,23 +460,111 @@ impl KeyStore {
         .collect()
     }
 
-    /// 串流迭代索引列,不把 36.8 萬列一次具現成 Vec。
-    /// callback 收到 (path, `basename_lower`) 的借用,想留就自己複製。
-    pub fn for_each_index_entry<F: FnMut(&str, &str)>(&self, mut f: F) {
+    /// 開一個唯讀快照,在它活著的期間所有讀取都看到同一個版本的 DB。
+    ///
+    /// **fuzzy / typo fallback 的兩階段之間一定要有它。** 第一階段記下 rowid、
+    /// 第二階段拿 rowid 換 path,而 `SQLite` 的 rowid 會回收 —— 刪掉目前最大
+    /// rowid 的那一列之後,下一次 INSERT 就會拿到同一個 rowid。daemon 隨時在
+    /// 做 delete + insert(`remove_subtree` 後面接一個新目錄的 `add` 就是),
+    /// 所以沒有快照的話,第二階段可能拿到一條**完全沒有 match 過查詢**的路徑,
+    /// 還把別人的分數貼上去。這種錯誤特別惡劣:那條路徑是剛剛才被建立的,
+    /// 一定存在,所以 `prune_dead_top` 與選取後的 `exists()` 都攔不住,
+    /// 使用者會直接被 cd 到一個莫名其妙的目錄。
+    ///
+    /// WAL 模式下的讀交易不擋寫入者,daemon 照常寫它的;代價只是這段期間
+    /// (幾十毫秒)不能 checkpoint。
+    ///
+    /// 用 `BEGIN DEFERRED`:快照是在第一次「讀」的時候才建立的,所以不會為了
+    /// 還沒開始的工作先卡住任何東西。
+    pub fn read_snapshot(&self) -> ReadSnapshot<'_> {
+        let began = self.conn.execute_batch("BEGIN DEFERRED").is_ok();
+        ReadSnapshot {
+            conn: &self.conn,
+            began,
+        }
+    }
+
+    /// 串流迭代索引列的 basename,**只碰 covering index、不碰主表**。
+    ///
+    /// 這是 fuzzy / typo fallback 的第一階段(過濾):先只看 basename 決定誰是
+    /// 候選,再用 `paths_by_rowid` 把那少數候選的 `path` 取回來。rowid 本來就
+    /// 隱含存在於每個索引項裡,所以 `SELECT rowid, basename_lower` 仍然是
+    /// covering scan —— 掃 6.5 MB 的 `idx_dirs_basename`,而不是 38 MB 的主表
+    /// (實測全撈 36.7 ms vs 帶 path 的 88.1 ms)。
+    ///
+    /// **千萬不要為了方便在這個 SQL 裡加上 `path`** —— 那一個欄位就會讓它退回
+    /// 掃主表,而且不會有任何測試失敗、只是每次 fallback 慢一倍。
+    ///
+    /// 順帶一提,走索引也就代表**列的順序是 (`basename_lower`, rowid),不是
+    /// rowid 順序**。呼叫端若拿順序當同分時的先後,結果會跟掃主表的版本不同
+    /// (分數本身不受影響)。
+    ///
+    /// callback 收到 (rowid, `basename_lower`) 的借用,想留就自己複製。
+    pub fn for_each_index_basename<F: FnMut(i64, &str)>(&self, mut f: F) {
         let Ok(mut stmt) = self
             .conn
-            .prepare_cached("SELECT path, basename_lower FROM dirs WHERE in_index = 1")
+            .prepare_cached("SELECT rowid, basename_lower FROM dirs WHERE in_index = 1")
         else {
             return;
         };
         let Ok(rows) = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
         }) else {
             return;
         };
         for row in rows.flatten() {
-            f(&row.0, &row.1);
+            f(row.0, &row.1);
         }
+    }
+
+    /// 串流迭代索引列的 (rowid, path)。這是第二階段的**大集合**走法:候選多到
+    /// 逐筆 rowid 探測不划算時,一次循序掃過去、用 rowid 對照候選集合。
+    /// 成本與舊版的 `for_each_index_entry` 相同(實測全撈 88 ms),差別只在
+    /// 不再需要 `basename_lower` —— 匹配在第一階段就做完了。
+    pub fn for_each_index_path<F: FnMut(i64, &str)>(&self, mut f: F) {
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT rowid, path FROM dirs WHERE in_index = 1")
+        else {
+            return;
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        }) else {
+            return;
+        };
+        for row in rows.flatten() {
+            f(row.0, &row.1);
+        }
+    }
+
+    /// 依 rowid 批次取回路徑(`for_each_index_basename` 之後的第二階段用)。
+    /// 回傳順序不保證,呼叫端自己配對/排序。查不到的 rowid 直接略過
+    /// (併發下該列可能已被 daemon 刪掉)。
+    ///
+    /// 逐筆 rowid 主鍵查而不是組一條動態 `IN (...)` 字串:候選數是幾百,
+    /// 每筆是一次 O(log n) 的 B-tree 探測,而動態字串會讓每次查詢的 SQL 都
+    /// 不同,`prepare_cached` 完全失效。
+    pub fn paths_by_rowid(&self, rowids: &[i64]) -> Vec<(i64, PathBuf)> {
+        if rowids.is_empty() {
+            return Vec::new();
+        }
+        let Ok(mut stmt) = self
+            .conn
+            .prepare_cached("SELECT path FROM dirs WHERE rowid = ?1")
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(rowids.len());
+        for &rowid in rowids {
+            if let Ok(path) = stmt.query_row(params![rowid], |row| {
+                let s: String = row.get(0)?;
+                Ok(PathBuf::from(s))
+            }) {
+                out.push((rowid, path));
+            }
+        }
+        out
     }
 
     // --- Clean ---
@@ -619,6 +729,26 @@ impl KeyStore {
 
 // --- Public types ---
 
+/// `KeyStore::read_snapshot` 的守衛。活著的期間,同一個連線上的所有讀取都看到
+/// 同一個版本的 DB;drop 時結束交易。
+///
+/// 只讀不寫 —— 交易裡不要做任何寫入,否則 drop 時的 COMMIT 會把它一起送出去
+/// (而呼叫端根本沒打算開一個寫交易)。
+pub struct ReadSnapshot<'a> {
+    conn: &'a rusqlite::Connection,
+    /// `BEGIN` 有沒有成功。失敗通常代表這個連線上已經有交易在跑,那就不能
+    /// 由我們來 COMMIT —— 會把別人的交易提早結束掉。
+    began: bool,
+}
+
+impl Drop for ReadSnapshot<'_> {
+    fn drop(&mut self) {
+        if self.began {
+            self.conn.execute_batch("COMMIT").ok();
+        }
+    }
+}
+
 /// `gd clean` 的成果報告。
 #[derive(Debug, Clone, Default)]
 pub struct CleanReport {
@@ -735,6 +865,49 @@ fn init_schema(conn: &Connection) -> Result<(), Error> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );",
+    )?;
+    // 索引純粹是效能設施,不是正確性的前提:少了它每次查詢慢幾十毫秒,但答案
+    // 一模一樣。所以建不起來就算了,絕不能讓 `gd` 整個開不起來 —— 第一次建立
+    // 是真寫入(36.8 萬列、6.5 MB、實測 152 ms 的寫鎖),若當下剛好撞上 daemon
+    // 的掃描或 `gd clean` 而超過 busy_timeout,`?` 會讓每一次 `gd` 都失敗。
+    if let Err(e) = create_query_indexes(conn) {
+        eprintln!("gd: could not create query indexes ({e}); queries will be slower");
+    }
+    Ok(())
+}
+
+/// `dirs` 的兩個查詢索引。**同樣的兩行也存在於 `index.rs` 的 `PathIndex::open`** —
+/// CLI 與 daemon 開的是同一個 DB,誰先開誰建,`IF NOT EXISTS` 讓它冪等。
+/// 改這裡請同步改那裡。刻意不放在任何長交易裡:建索引要寫鎖,包進 bulk
+/// transaction 會把持鎖時間從毫秒級拉到秒級,擋住另一邊的查詢。
+///
+/// **核心前提(改任何查詢前先讀這段)**:`SQLite` 只有在「查詢引用到的欄位全部
+/// 都在索引裡」時才會走 covering index,否則它會拿索引找到 rowid、再回頭讀
+/// 主表。`dirs` 表本體 38.8 MB、主鍵索引 35 MB,而 `idx_dirs_basename` 只有
+/// 6.5 MB —— 差別就是掃 6.5 MB 還是 38.8 MB。實測:`SELECT path FROM dirs
+/// WHERE in_index = 1 AND basename_lower LIKE ?` 加了索引仍要 25 ms(因為
+/// SELECT 了 `path`,不是 covering);改成先用子查詢只取 rowid 再取 path 才
+/// 降到 16.8 ms。
+///
+/// 也就是說:**在這些查詢的過濾階段多 SELECT 一個欄位,就會靜默退化回全表掃,
+/// 而且不會有任何測試失敗**。要加欄位請先跑 EXPLAIN QUERY PLAN 確認還是
+/// `COVERING INDEX`。
+fn create_query_indexes(conn: &Connection) -> Result<(), Error> {
+    conn.execute_batch(
+        // 部分索引(WHERE 子句):只涵蓋「有歷史」的列。實測全庫 26.7 萬列裡
+        // 只有 283 列有歷史,所以這個索引只有 24 KB,卻讓 search_history /
+        // search_history_multi / history_count / all_history 從「在 26.7 萬列
+        // 裡全表掃出那 283 列」變成掃一個 24 KB 的索引(22.6 ms → 1.8 ms)。
+        // 欄位清單刻意涵蓋 search_history 用到的全部五欄,少一欄就不是 covering。
+        "CREATE INDEX IF NOT EXISTS idx_dirs_history
+            ON dirs(basename_lower, path, visits, selections, last_access)
+            WHERE visits > 0 OR selections > 0;
+
+        -- 覆蓋索引:讓「只看 basename 的過濾階段」不必碰 38 MB 的主表。
+        -- 欄位順序不要改:basename_lower 必須在前,這樣它才能同時服務
+        -- 前綴/範圍形式的查詢;in_index 只是為了把過濾條件也蓋進索引,
+        -- 讓 SQLite 不必為了判斷 in_index 而回主表取列。
+        CREATE INDEX IF NOT EXISTS idx_dirs_basename ON dirs(basename_lower, in_index);",
     )?;
     Ok(())
 }
