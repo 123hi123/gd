@@ -80,8 +80,23 @@ pub struct App {
 
 pub struct CandidateView {
     pub path: PathBuf,
-    pub valid: bool,
+    /// Lazily-stat'ed existence, cached for the picker session. `None` = not
+    /// checked yet. Only rows that actually reach the screen (or the Enter key)
+    /// pay the stat — eagerly stat'ing the whole candidate set is seconds of
+    /// cold-cache IO when a generic query matches tens of thousands of rows.
+    valid: Cell<Option<bool>>,
     pub source: ResultSource,
+}
+
+impl CandidateView {
+    pub fn is_valid(&self) -> bool {
+        if let Some(v) = self.valid.get() {
+            return v;
+        }
+        let v = self.path.exists();
+        self.valid.set(Some(v));
+        v
+    }
 }
 
 /// Reorder a rank-sorted list (best first) into a center-out spread: the best
@@ -119,7 +134,7 @@ impl App {
             .iter()
             .map(|c| CandidateView {
                 path: c.path.clone(),
-                valid: c.path.exists(),
+                valid: Cell::new(None),
                 source: c.source.clone(),
             })
             .collect();
@@ -316,11 +331,23 @@ impl App {
     pub fn select_current(&self) -> Action {
         if let Some(&orig) = self.order.get(self.cursor) {
             let cv = &self.all_candidates[orig];
-            if cv.valid {
+            if cv.is_valid() {
                 return Action::Select(cv.path.clone());
             }
         }
         Action::Continue
+    }
+
+    /// Paths this picker session happened to stat and found dead — the caller
+    /// batch-retires them so every picker run leaves the index a little
+    /// cleaner. Never stats anything itself: rows whose validity was never
+    /// needed stay unchecked (`None`) and are not reported.
+    pub fn discovered_dead(&self) -> Vec<PathBuf> {
+        self.all_candidates
+            .iter()
+            .filter(|c| c.valid.get() == Some(false))
+            .map(|c| c.path.clone())
+            .collect()
     }
 
     pub fn enter_filter(&mut self) {

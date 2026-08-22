@@ -153,7 +153,7 @@ fn render_candidates(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
             (theme.path_parent, theme.path_basename_dim, Style::default())
         };
 
-        let invalid_prefix = if candidate.valid { "" } else { "✗ " };
+        let invalid_prefix = if candidate.is_valid() { "" } else { "✗ " };
         let tag_text = format!(" [{tag}]", tag = source_tag.0);
 
         // All widths below are *display columns*, not bytes. CJK dir names

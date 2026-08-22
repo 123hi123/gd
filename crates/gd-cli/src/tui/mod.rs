@@ -21,12 +21,15 @@ const MAX_INLINE_ROWS: usize = 12;
 
 type TtyTerminal = Terminal<CrosstermBackend<std::fs::File>>;
 
+/// Returns the chosen path (None = cancelled) plus every candidate the picker
+/// happened to stat and found dead — the caller retires those, so dead rows
+/// drain from the index a few per picker run instead of lingering forever.
 pub fn pick(
     key: &str,
     candidates: &[Candidate],
     mode: LayoutMode,
     lang: Lang,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<(Option<PathBuf>, Vec<PathBuf>)> {
     let tty = std::fs::File::options()
         .read(true)
         .write(true)
@@ -71,7 +74,7 @@ fn run_fullscreen(
     mode: LayoutMode,
     lang: Lang,
     theme: &theme::Theme,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<(Option<PathBuf>, Vec<PathBuf>)> {
     crossterm::execute!(io::stderr(), EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(tty);
@@ -88,7 +91,7 @@ fn run_fullscreen(
     terminal.clear()?;
     crossterm::execute!(io::stderr(), LeaveAlternateScreen)?;
 
-    result
+    result.map(|sel| (sel, app.discovered_dead()))
 }
 
 /// Inline picker (bottom): a compact block drawn in place at the prompt via an
@@ -103,7 +106,7 @@ fn run_inline(
     mode: LayoutMode,
     lang: Lang,
     theme: &theme::Theme,
-) -> io::Result<Option<PathBuf>> {
+) -> io::Result<(Option<PathBuf>, Vec<PathBuf>)> {
     // crossterm reads the size from /dev/tty, so this is correct even though
     // gd's stdout is a pipe (`cd "$(gd …)"`).
     let term_height = terminal::size().map_or(24, |(_, rows)| rows as usize);
@@ -156,7 +159,7 @@ fn run_inline(
         }
     }
 
-    result
+    result.map(|sel| (sel, app.discovered_dead()))
 }
 
 fn run_loop(

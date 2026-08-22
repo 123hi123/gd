@@ -199,22 +199,9 @@ impl KeyStore {
         rows.filter_map(Result::ok).collect()
     }
 
-    pub fn boost_for(&self, path: &Path) -> f64 {
-        let mut stmt = self
-            .conn
-            .prepare_cached("SELECT path, multiplier FROM boosts")
-            .unwrap();
-        let mut rows = stmt.query([]).unwrap();
-        while let Ok(Some(row)) = rows.next() {
-            let boosted: String = row.get(0).unwrap();
-            let mult: f64 = row.get(1).unwrap();
-            if path.starts_with(&boosted) {
-                return mult;
-            }
-        }
-        1.0
-    }
-
+    // 這裡刻意沒有單一路徑版的 boost 查詢:呼叫端一律 `list_boosts()` 撈整張
+    // 表(就幾列)再在記憶體裡比對。曾經有過 per-path 的 `boost_for`,結果被
+    // 放進逐列迴圈,一次查詢跑了上萬次 SQL。
     // --- History ---
 
     pub fn record_visit(&mut self, path: &Path) {

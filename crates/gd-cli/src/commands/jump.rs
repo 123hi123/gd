@@ -119,7 +119,17 @@ pub fn run(store: &mut KeyStore, query: &str) -> Result<()> {
 
         let mode = crate::tui::LayoutMode::from_setting(store.get_setting("layout").as_deref());
         let lang = crate::i18n::Lang::resolve(store.get_setting("language").as_deref());
-        match crate::tui::pick(query, &candidates, mode, lang)? {
+        let (choice, dead) = crate::tui::pick(query, &candidates, mode, lang)?;
+        // picker 渲染時順手 stat 到的死路徑(lazy 驗證,見 CandidateView),
+        // 取消也照樣退場 —— 每開一次 picker,索引就乾淨一點。退場前逐筆
+        // 重驗:快取的 stat 是渲染當下的結果,而 TUI 可以開著幾分鐘,期間
+        // 被重建的目錄(daemon 已重新入索引)不能拿舊快取去刪。清單只有
+        // 被渲染到的那幾筆,重驗是常數成本。
+        let dead: Vec<PathBuf> = dead.into_iter().filter(|p| !p.exists()).collect();
+        if !dead.is_empty() {
+            store.retire_missing_batch(&dead);
+        }
+        match choice {
             Some(path) => path,
             None => process::exit(130),
         }
@@ -182,6 +192,20 @@ fn prune_dead_top(store: &KeyStore, results: &mut Vec<SearchResult>, k: usize) {
 fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
     let mut results = Vec::new();
 
+    // boosts 整張表先撈一次(實務上就幾列),之後純記憶體比對。以前這裡是
+    // 每列結果各跑一次 boost_for 的 SQL —— 查 "ib" 命中 1.2 萬列就是 1.2 萬
+    // 次查詢,佔掉整條熱路徑的兩位數毫秒。fallback 兩條路早就這樣寫了,
+    // 這裡跟進,順便統一了巢狀 boost 的比對順序(BTreeMap 的路徑字典序)。
+    let boosts = store.list_boosts();
+    let boost_for = |path: &Path| -> f64 {
+        for (boosted_dir, multiplier) in &boosts {
+            if path.starts_with(boosted_dir) {
+                return *multiplier;
+            }
+        }
+        1.0
+    };
+
     if keywords.len() <= 1 {
         let query = keywords.first().copied().unwrap_or("");
         let query_lower = query.to_lowercase();
@@ -198,8 +222,7 @@ fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
         let mut history = store.search_history(query);
         for r in &mut history {
-            let boost = store.boost_for(&r.path);
-            r.score *= boost;
+            r.score *= boost_for(&r.path);
         }
         results.extend(history);
 
@@ -239,7 +262,7 @@ fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 }
             }
 
-            rank *= store.boost_for(&path);
+            rank *= boost_for(&path);
 
             results.push(SearchResult {
                 path,
@@ -252,8 +275,7 @@ fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
 
         let mut history = store.search_history_multi(keywords);
         for r in &mut history {
-            let boost = store.boost_for(&r.path);
-            r.score *= boost;
+            r.score *= boost_for(&r.path);
         }
         results.extend(history);
 
@@ -293,7 +315,7 @@ fn gather_results(store: &KeyStore, keywords: &[&str]) -> Vec<SearchResult> {
                 }
             }
 
-            rank *= store.boost_for(&path);
+            rank *= boost_for(&path);
 
             results.push(SearchResult {
                 path,
@@ -855,8 +877,10 @@ fn dedup_results(results: &mut Vec<SearchResult>) {
 /// immediately `gd f` to jump in" case: the just-made `foo` should win over some old
 /// `f*` habit. The signal is *recency*, not query length, so it self-expires (an
 /// hour later `foo` ranks by its real history again) and a multi-keyword — i.e. more
-/// specific — query never triggers it. Cost is a single `stat()` on the handful of
-/// cwd-descendants already in the result set.
+/// specific — query never triggers it. Cost is a single `stat()` per cwd-descendant
+/// in the result set; past `MAX_FRESH_STATS` descendants only *direct children* of
+/// cwd are checked, because "handful" stops being true when cwd is $HOME and the
+/// query is generic (see the comment at the bound for why skipping entirely is wrong).
 fn apply_cwd_proximity(results: &mut [SearchResult], single_keyword: bool) {
     // 100_000 (SELECTED_TIER) + 15 == 1.5 selection steps of 10 each.
     const CWD_PROXIMITY: f64 = 100_015.0;
@@ -868,20 +892,47 @@ fn apply_cwd_proximity(results: &mut [SearchResult], single_keyword: bool) {
     // How recently a dir must have been created/touched to count as "fresh".
     const FRESH_WINDOW_SECS: u64 = 300; // 5 minutes
 
+    // 新鮮度檢查要 stat,而這整個功能的成本假設是「cwd 底下的結果就那麼
+    // 幾筆」。站在 $HOME 查一個泛用字時這個假設會爆掉:幾乎每個命中都是
+    // descendant(實測 "ib" 是 1.2 萬筆),逐筆 stat 跟當初 App::new 全量
+    // stat 一樣是秒級。超過這個數就退到只檢查 cwd 的**直接子目錄**。
+    // 不能整段跳過:上面的 floor 把所有 descendant 墊成同分(depth 加分
+    // 被 max 吃掉,沒有誰「仍會浮上來」),stable sort 之下剛建的目錄
+    // (最新 rowid)反而沉在同分區塊最底 —— 「md foo 然後 gd f」就死了。
+    // 直接子目錄剛好是那個招牌流程的形狀,量級是一個 readdir;更深的
+    // 新鮮目錄在退化情境確實得不到拉抬,會混在同分區塊裡。
+    const MAX_FRESH_STATS: usize = 300;
+
     let Ok(cwd) = std::env::current_dir() else {
         return;
     };
     let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
-    let now = gd_core::frecency::now_secs();
-    for r in results.iter_mut() {
+
+    let mut descendants: Vec<usize> = Vec::new();
+    for (i, r) in results.iter_mut().enumerate() {
         if r.path != cwd && r.path.starts_with(&cwd) {
             r.score = r.score.max(CWD_PROXIMITY);
-            if single_keyword {
-                if let Some(age) = dir_age_secs(&r.path, now) {
-                    if age <= FRESH_WINDOW_SECS {
-                        r.score = r.score.max(FRESH_TIER);
-                    }
-                }
+            descendants.push(i);
+        }
+    }
+
+    if !single_keyword {
+        return;
+    }
+    let fresh_check: Vec<usize> = if descendants.len() <= MAX_FRESH_STATS {
+        descendants
+    } else {
+        descendants
+            .into_iter()
+            .filter(|&i| results[i].path.parent() == Some(cwd.as_path()))
+            .take(MAX_FRESH_STATS)
+            .collect()
+    };
+    let now = gd_core::frecency::now_secs();
+    for &i in &fresh_check {
+        if let Some(age) = dir_age_secs(&results[i].path, now) {
+            if age <= FRESH_WINDOW_SECS {
+                results[i].score = results[i].score.max(FRESH_TIER);
             }
         }
     }
