@@ -154,7 +154,7 @@ gd clean                remove dead entries
 gd export               dump database as JSON
 gd doctor               check installation health
 gd setup                install daemon + hook + cd alias
-gd update               rebuild and restart (developers)
+gd --update             rebuild and restart (developers)
 ```
 
 ## Comfort by design

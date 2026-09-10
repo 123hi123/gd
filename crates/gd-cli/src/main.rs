@@ -18,6 +18,13 @@ use gd_core::db::KeyStore;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if cli.update {
+        // clap 的 conflicts_with 管不到 subcommand,自己擋
+        if cli.command.is_some() {
+            anyhow::bail!("--update takes no subcommand");
+        }
+        return commands::update::run();
+    }
     let data_dir = cli.data_dir.as_deref();
 
     if !cli.query.is_empty() {
@@ -72,9 +79,6 @@ fn main() -> Result<()> {
         }
         Some(Command::Setup) => {
             commands::setup::run()
-        }
-        Some(Command::Update) => {
-            commands::update::run()
         }
         Some(Command::Boost { ref path, weight }) => {
             let mut store = KeyStore::open(data_dir)?;

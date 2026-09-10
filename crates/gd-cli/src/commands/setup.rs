@@ -1,31 +1,56 @@
 use anyhow::{Context, Result};
 use std::fs;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const SERVICE_CONTENT: &str = include_str!("../shell/gd-daemon.service");
 
-/// 寫入(或覆寫)systemd user unit。`gd setup` 與 `gd update` 共用:
+/// 寫入(或覆寫)systemd user unit。`gd setup` 與 `gd --update` 共用:
 /// unit 裡的資源限制(Nice/IOSchedulingClass 等)也是程式的一部分,
-/// 更新 binary 時必須一起跟上。
-pub fn install_service_unit(home: &std::path::Path) -> Result<PathBuf> {
+/// 更新 binary 時必須一起跟上。ExecStart 指向實際裝好的 daemon —— 每台機器
+/// 的安裝目錄不同(~/.cargo/bin、~/.local/bin),範本寫死的路徑只是預設。
+pub fn install_service_unit(home: &Path, daemon_bin: Option<&Path>) -> Result<PathBuf> {
     let service_dir = home.join(".config/systemd/user");
     fs::create_dir_all(&service_dir)?;
     let service_path = service_dir.join("gd-daemon.service");
-    fs::write(&service_path, SERVICE_CONTENT)?;
+    fs::write(&service_path, render_service_unit(home, daemon_bin))?;
     Ok(service_path)
+}
+
+fn render_service_unit(home: &Path, daemon_bin: Option<&Path>) -> String {
+    let Some(bin) = daemon_bin else {
+        return SERVICE_CONTENT.to_string();
+    };
+    // 家目錄底下的路徑保留 %h 寫法,跟範本一致
+    let exec = match bin.strip_prefix(home) {
+        Ok(rel) => format!("%h/{}", rel.display()),
+        Err(_) => bin.display().to_string(),
+    };
+    let mut out = String::with_capacity(SERVICE_CONTENT.len() + 32);
+    for line in SERVICE_CONTENT.lines() {
+        if line.starts_with("ExecStart=") {
+            out.push_str("ExecStart=");
+            out.push_str(&exec);
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 pub fn run() -> Result<()> {
     let home = dirs::home_dir().context("cannot determine home directory")?;
 
-    // 1. Install systemd user service
-    let service_path = install_service_unit(&home)?;
+    // 1. Find the daemon binary — the unit's ExecStart has to point at it
+    let daemon_bin = find_daemon_binary(&home);
+
+    // 2. Install systemd user service
+    let service_path = install_service_unit(&home, daemon_bin.as_deref())?;
     eprintln!("installed {}", service_path.display());
 
-    // 2. Set CAP_SYS_ADMIN on daemon binary
-    let daemon_bin = find_daemon_binary(&home);
+    // 3. Set CAP_SYS_ADMIN on daemon binary
     if let Some(ref bin) = daemon_bin {
         eprintln!("setting CAP_SYS_ADMIN on {}...", bin.display());
         let status = Command::new("sudo")
@@ -40,7 +65,7 @@ pub fn run() -> Result<()> {
         eprintln!("warning: gd-daemon binary not found. Install it first:\n  cargo install --path crates/gd-daemon");
     }
 
-    // 3. Enable and start service
+    // 4. Enable and start service
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
@@ -63,14 +88,14 @@ pub fn run() -> Result<()> {
         _ => eprintln!("warning: could not enable service. Try:\n  systemctl --user enable --now gd-daemon"),
     }
 
-    // 4. Install shell hook
+    // 5. Install shell hook
     let shell = detect_current_shell();
     let rc_path = shell_rc_path(&home, &shell);
 
     if let Some(ref rc) = rc_path {
         install_shell_hook(rc, &shell)?;
 
-        // 5. Ask about cd alias
+        // 6. Ask about cd alias
         eprintln!();
         eprintln!("gd fully covers cd and adds smart search on top.");
         eprint!("replace cd with gd? (alias cd=gd) [Y/n] ");
@@ -283,11 +308,19 @@ fn print_manual_instructions() {
     eprintln!("  powershell: Invoke-Expression (gd init powershell)");
 }
 
-fn find_daemon_binary(home: &std::path::Path) -> Option<PathBuf> {
+/// 先看 PATH 上「就是現在這個 gd」的那個目錄(`gd setup` 幾乎都是裝好的 gd
+/// 自己跑的,兩個 binary 一起裝;用 PATH 寫法、不展開 symlink,跟 `gd --update`
+/// 寫進 unit 的路徑一致),再看常見安裝位置。
+/// 故意不看 `current_exe` 旁邊的檔:從 target/release/gd 跑 setup 會把 unit 綁到
+/// build 產物上,下次 cargo build 一換 inode,capability 就掉了。
+fn find_daemon_binary(home: &Path) -> Option<PathBuf> {
+    let on_path = crate::commands::update::running_gd_dir().map(|dir| dir.join("gd-daemon"));
     let candidates = [
-        home.join(".cargo/bin/gd-daemon"),
-        PathBuf::from("/usr/local/bin/gd-daemon"),
-        PathBuf::from("/usr/bin/gd-daemon"),
+        on_path,
+        Some(home.join(".cargo/bin/gd-daemon")),
+        Some(home.join(".local/bin/gd-daemon")),
+        Some(PathBuf::from("/usr/local/bin/gd-daemon")),
+        Some(PathBuf::from("/usr/bin/gd-daemon")),
     ];
-    candidates.into_iter().find(|p| p.exists())
+    candidates.into_iter().flatten().find(|p| p.is_file())
 }

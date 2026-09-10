@@ -16,6 +16,11 @@ pub struct Cli {
     #[arg(value_name = "QUERY", conflicts_with = "command")]
     pub query: Vec<String>,
 
+    /// Rebuild gd from its source checkout and reinstall gd + gd-daemon (developers).
+    /// A flag rather than a subcommand so that `cd update` still means "a directory named update".
+    #[arg(long, conflicts_with = "query")]
+    pub update: bool,
+
     /// Override data directory
     #[arg(long, global = true)]
     pub data_dir: Option<PathBuf>,
@@ -104,9 +109,6 @@ pub enum Command {
 
     /// Install systemd service and shell hook
     Setup,
-
-    /// Rebuild and restart daemon without full rescan
-    Update,
 
     /// Boost a directory and all paths below it
     Boost {

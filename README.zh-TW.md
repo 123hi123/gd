@@ -154,7 +154,7 @@ gd clean                清除失效的條目
 gd export               匯出資料庫（JSON）
 gd doctor               檢查安裝狀態
 gd setup                安裝 daemon + hook + cd 別名
-gd update               重新編譯並重啟（開發者用）
+gd --update             重新編譯並重啟（開發者用）
 ```
 
 ## 舒適，是刻意設計的

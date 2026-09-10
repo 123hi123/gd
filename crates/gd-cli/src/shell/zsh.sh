@@ -10,7 +10,7 @@ add-zsh-hook chpwd __gd_hook
 
 gd() {
     case "$1" in
-        link|unlink|config|list|clean|export|init|doctor|setup|update|boost|unboost|version|help|hook|"-h"|"--help"|"-V"|"--version")
+        link|unlink|config|list|clean|export|init|doctor|setup|"--update"|boost|unboost|version|help|hook|"-h"|"--help"|"-V"|"--version")
             __gd_bin "$@"
             return $?
             ;;

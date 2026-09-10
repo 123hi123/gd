@@ -1,6 +1,6 @@
-def --env gd [...args] {
+def --env --wrapped gd [...args] {
     let first = ($args | get -i 0)
-    let info_cmds = [link unlink config list clean export init doctor setup update boost unboost version help hook -h --help -V --version]
+    let info_cmds = [link unlink config list clean export init doctor setup --update boost unboost version help hook -h --help -V --version]
     if ($first | is-not-empty) and ($first in $info_cmds) {
         ^gd ...$args
         return

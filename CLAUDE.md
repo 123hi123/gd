@@ -16,11 +16,13 @@ gd-daemon       — fanotify filesystem watcher + index builder (CAP_SYS_ADMIN +
 
 ## Development workflow
 
-**After any code change, run `gd update` in the project directory to deploy to the local system.**
+**After any code change, run `gd --update` (from any directory) to deploy to the local system.**
 
-`gd update` does: stop daemon → cargo build --release → copy binaries → setcap → restart daemon (no full rescan).
+`gd --update` does: cargo build --release in the checkout you are in (cwd or any ancestor; falls back to the checkout baked in at build time, so it works from any directory) → stop daemon → install binaries next to the running `gd` (`~/.local/bin` or `~/.cargo/bin`, whichever it lives in) → setcap → rewrite the unit with that ExecStart → restart daemon (downtime is seconds, so no catchup rescan).
 
-If `gd update` is not yet installed (first time), run manually:
+It is a flag, not a subcommand: `cd update` must keep meaning "a directory named update".
+
+If `gd --update` is not yet installed (first time), run manually (use `~/.local/bin` instead if that is where `gd` lives):
 ```bash
 systemctl --user stop gd-daemon
 cargo build --release --all
@@ -29,6 +31,8 @@ cp -f target/release/gd-daemon ~/.cargo/bin/gd-daemon
 sudo setcap cap_sys_admin,cap_dac_read_search+ep ~/.cargo/bin/gd-daemon
 systemctl --user start gd-daemon
 ```
+
+Either way, after installing a new `gd` run `exec $SHELL` (or open a new terminal): the `gd()` shell wrapper is expanded from `gd init` at shell startup, so an already-open shell keeps the old reserved-word list (e.g. it still treats `update` as a subcommand) until then.
 
 ## Search priority (TUI ordering)
 
@@ -58,7 +62,7 @@ systemctl --user start gd-daemon
   (`retire_missing`: index-only rows deleted, history rows marked out-of-index;
   `gd clean` for a full sweep). Event-mode gaps are self-healing: FAN_Q_OVERFLOW
   triggers one catchup after the burst settles (≥5 min apart); startup catchup
-  covers daemon downtime (skipped when downtime < 60 s, so `gd update` restarts
+  covers daemon downtime (skipped when downtime < 60 s, so `gd --update` restarts
   don't walk the tree). Scans are rare, so they run fast (parallelism =
   min(cores, 8)) — the idle scheduling class in the unit is what keeps them
   invisible, not artificial slowness.

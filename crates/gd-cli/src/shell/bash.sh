@@ -8,7 +8,7 @@ PROMPT_COMMAND="__gd_hook;${PROMPT_COMMAND}"
 
 gd() {
     case "$1" in
-        link|unlink|config|list|clean|export|init|doctor|setup|update|boost|unboost|version|help|hook|"-h"|"--help"|"-V"|"--version")
+        link|unlink|config|list|clean|export|init|doctor|setup|"--update"|boost|unboost|version|help|hook|"-h"|"--help"|"-V"|"--version")
             __gd_bin "$@"
             return $?
             ;;

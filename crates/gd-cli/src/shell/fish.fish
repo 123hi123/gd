@@ -4,7 +4,7 @@ end
 
 function gd
     switch $argv[1]
-        case link unlink config list clean export init doctor setup update boost unboost version help hook '-h' '--help' '-V' '--version'
+        case link unlink config list clean export init doctor setup '--update' boost unboost version help hook '-h' '--help' '-V' '--version'
             command gd $argv
             return $status
         case '-'

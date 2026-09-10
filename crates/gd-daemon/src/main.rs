@@ -27,7 +27,7 @@ const OVERFLOW_CATCHUP_MIN_SECS: u64 = 5 * 60;
 /// 但最需要補掃的事件洪水期間恰恰沒有安靜空檔 → 補掃會被無限延後。
 /// 標記起來超過這個時間就不等安靜了,直接補掃。
 const OVERFLOW_FORCE_CATCHUP_SECS: u64 = 10 * 60;
-/// 停機不足這個秒數就跳過啟動 catchup:`gd update` 那種十幾秒的重啟不值得
+/// 停機不足這個秒數就跳過啟動 catchup:`gd --update` 那種幾秒的重啟不值得
 /// 一次全樹走訪(這麼短的空窗內的變更,靠 shell hook 與 lazy 修正即可)。
 const STARTUP_CATCHUP_MIN_DOWNTIME_SECS: u64 = 60;
 
@@ -166,7 +166,7 @@ fn main() -> Result<()> {
             index.len()
         );
     } else if let Some(ts) = read_timestamp(&timestamp_file) {
-        // 上次乾淨關閉:補上停機期間新增的目錄 — 但短暫重啟(gd update)
+        // 上次乾淨關閉:補上停機期間新增的目錄 — 但短暫重啟(gd --update)
         // 不值得為十幾秒的空窗走訪整棵樹。
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
